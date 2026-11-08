@@ -121,8 +121,13 @@ The package examples show each of these in runnable form.
 With a security file, a filter needs only the fixed fields:
 
 ```
-failregex = ^time=\S+ level=WARN event=login_failed .*\bsrc_ip=<HOST>(\s|$)
+failregex = ^time=\S* level=WARN event=login_failed .*\bsrc_ip=<HOST>(\s|$)
 ```
+
+fail2ban strips the timestamp before matching, which leaves `time=` empty,
+hence `\S*`. An event with a `Limit` writes at most one line per key and
+minute, so each line stands for at least one failure in that minute: set
+`maxretry` and `findtime` in those terms (for example 3 lines in 10m).
 
 ## License
 
