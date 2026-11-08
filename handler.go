@@ -35,7 +35,7 @@ func (h *handler) Handle(ctx context.Context, sr slog.Record) error {
 	rp := recordPool.Get().(*Record)
 	defer putRecord(rp)
 	r := rp
-	*r = Record{Time: sr.Time, Level: sr.Level, Module: h.module, Msg: sr.Message, Attrs: r.Attrs[:0]}
+	*r = Record{Time: sr.Time, Level: sr.Level, Module: h.module, Msg: sr.Message, Attrs: r.Attrs[:0], secrets: h.logs.secrets.Load()}
 	if r.Time.IsZero() {
 		r.Time = time.Now()
 	}

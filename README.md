@@ -94,7 +94,9 @@ Every encoder writes the fixed fields first, in the order `time`, `level`,
 quoted and escaped so no input can forge a line: an attribute named like a
 fixed field is written as `_level`, control characters and bidi overrides
 are escaped, a value whose `Error` or `String` panics is written as
-`!PANIC`, and `slogx.Redacted` values as `[REDACTED]`. `Pretty` is for
+`!PANIC`, and `slogx.Redacted` values as `[REDACTED]` (unless `Config.LogSecrets`, a
+development-only switch that warns when it turns on, writes them as they
+are). `Pretty` is for
 people and not meant to be parsed.
 
 ## More

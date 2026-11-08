@@ -151,3 +151,53 @@ func TestJoinContextSkipsNil(t *testing.T) {
 		t.Fatalf("JoinContext = %v", got)
 	}
 }
+
+func TestLogSecrets(t *testing.T) {
+	l := New()
+	defer l.Close()
+	cfg := Config{Console: ConsoleOff, Memory: 8}
+	if err := l.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Module("auth")
+	m.Info("key", "vkey", Redacted("s3cret"), slog.Group("g", "token", Redacted("t0k")))
+	cfg.LogSecrets = true
+	if err := l.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	m.Info("key", "vkey", Redacted("s3cret"), slog.Group("g", "token", Redacted("t0k")))
+	if err := l.Configure(cfg); err != nil { // still on: no second warning
+		t.Fatal(err)
+	}
+	text := l.Memory().Text(Query{}, TextEncoder{})
+	for _, want := range []string{
+		"vkey=[REDACTED] g.token=[REDACTED]",
+		"event=log_secrets",
+		"vkey=s3cret g.token=t0k",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+	if n := strings.Count(text, "event=log_secrets"); n != 1 {
+		t.Errorf("%d log_secrets warnings, want 1:\n%s", n, text)
+	}
+}
+
+func TestSetLogSecrets(t *testing.T) {
+	l := New()
+	defer l.Close()
+	if err := l.Configure(Config{Console: ConsoleOff, Memory: 8}); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Module("auth")
+	l.SetLogSecrets(true)
+	l.SetLogSecrets(true)
+	m.Info("on", "k", Redacted("v1"))
+	l.SetLogSecrets(false)
+	m.Info("off", "k", Redacted("v2"))
+	text := l.Memory().Text(Query{}, TextEncoder{})
+	if strings.Count(text, "event=log_secrets") != 1 || !strings.Contains(text, "k=v1") || !strings.Contains(text, "k=[REDACTED]") || strings.Contains(text, "v2") {
+		t.Fatalf("lines:\n%s", text)
+	}
+}

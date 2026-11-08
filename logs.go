@@ -73,6 +73,11 @@ type Config struct {
 
 	// AddSource adds source=file:line to every line.
 	AddSource bool
+	// LogSecrets writes Redacted values as they are instead of
+	// [REDACTED], for debugging during development only; never set it in
+	// production. Turning it on writes an EventLogSecrets warning.
+	// Logs.SetLogSecrets switches it without a Configure.
+	LogSecrets bool
 	// StackFrom, when not nil, adds the stack to lines at or above its
 	// level, such as slog.LevelError. As with slog.HandlerOptions.Level, a
 	// nil pointer inside the interface is not allowed.
@@ -93,7 +98,8 @@ type Logs struct {
 	// attachedBelow: an attached route sees lines below the level table.
 	attachedBelow atomic.Bool
 	sampler       sampler
-	mu            sync.Mutex // Configure, Close, Attach
+	secrets       atomic.Bool // Redacted values are written as they are
+	mu            sync.Mutex  // Configure, Close, Attach
 }
 
 // pipeline is one configuration, replaced whole. Lines in flight hold mu
@@ -237,6 +243,7 @@ func (l *Logs) Configure(c Config) error {
 	l.pipe.Store(p)
 	l.mu.Unlock()
 	retire(old, p.memory)
+	l.SetLogSecrets(c.LogSecrets)
 	for _, f := range fallback {
 		Emit(context.Background(), l.Module("slogx"), &logFallback, "reason", f)
 	}
@@ -410,4 +417,13 @@ func stack() string {
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// SetLogSecrets switches Config.LogSecrets at once, for the lines written
+// from then on; turning it on writes an EventLogSecrets warning. The next
+// Configure sets it again from its Config.
+func (l *Logs) SetLogSecrets(on bool) {
+	if l.secrets.Swap(on) != on && on {
+		Emit(context.Background(), l.Module("slogx"), &logSecrets)
+	}
 }

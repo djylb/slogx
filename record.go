@@ -24,6 +24,8 @@ type Record struct {
 	// Stack is the goroutine stack when the line is at or above
 	// Config.StackFrom.
 	Stack string
+
+	secrets bool // Redacted values are written as they are
 }
 
 // Clone returns a copy of r that may be kept.
@@ -64,6 +66,11 @@ func (r *Record) add(a slog.Attr, prefix string) {
 		if dv, ok := a.Value.Any().(defValue); ok {
 			r.Def, r.Event = dv.d, dv.d.Name
 			return
+		}
+	}
+	if r.secrets && a.Value.Kind() == slog.KindLogValuer {
+		if s, ok := a.Value.Any().(Redacted); ok {
+			a.Value = slog.StringValue(string(s))
 		}
 	}
 	a.Value = a.Value.Resolve()

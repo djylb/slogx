@@ -94,15 +94,19 @@ const (
 	// EventTLSHandshakeFailed is written at debug, limited per src_ip, when
 	// net/http reports a failed TLS handshake (HTTPErrorLog).
 	EventTLSHandshakeFailed = "tls_handshake_failed"
+	// EventLogSecrets is written at warn when Config.LogSecrets turns on:
+	// Redacted values are written as they are from then on.
+	EventLogSecrets = "log_secrets"
 )
 
 var (
 	logFallback        = Def{Name: EventLogFallback, Level: slog.LevelWarn}
 	logDropped         = Def{Name: EventLogDropped, Level: slog.LevelWarn}
+	logSecrets         = Def{Name: EventLogSecrets, Level: slog.LevelWarn, Msg: "secrets are logged; for development only"}
 	tlsHandshakeFailed = Def{Name: EventTLSHandshakeFailed, Level: slog.LevelDebug, Limit: "src_ip"}
 )
 
-func init() { Register(&logFallback, &logDropped, &tlsHandshakeFailed) }
+func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFailed) }
 
 // Emit writes event d at its level to l with the given attributes (as
 // slog's args), carrying the attributes of ctx (Config.Context). The line's
@@ -162,8 +166,10 @@ func splitMsg(msg string, args []any) (string, []any, []any) {
 	return msg, args, nil
 }
 
-// Redacted is a value that never reaches a log: it is written as
-// [REDACTED]. Wrap secrets in it when they must travel with other values.
+// Redacted is a secret value: it is written as [REDACTED], or as it is
+// while Config.LogSecrets is on. Wrap secrets in it when they must travel
+// with other values. A Redacted message (the msg argument of Emit) is
+// always [REDACTED].
 type Redacted string
 
 // LogValue implements slog.LogValuer.
