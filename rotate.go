@@ -63,7 +63,7 @@ type Rotating struct {
 	size    int64
 	opened  time.Time
 	closed  bool
-	work    chan string // rotated files to compress and prune
+	work    chan struct{} // a rotation happened: compress and prune
 	workers sync.WaitGroup
 }
 
@@ -77,7 +77,7 @@ func OpenRotating(c Rotation) (*Rotating, error) {
 	}
 	name := filepath.Base(c.Path)
 	ext := filepath.Ext(name)
-	r := &Rotating{cfg: c, dir: filepath.Dir(c.Path), base: strings.TrimSuffix(name, ext), ext: ext, work: make(chan string, 16)}
+	r := &Rotating{cfg: c, dir: filepath.Dir(c.Path), base: strings.TrimSuffix(name, ext), ext: ext, work: make(chan struct{}, 1)}
 	if err := r.open(); err != nil {
 		return nil, err
 	}
@@ -146,8 +146,8 @@ func (r *Rotating) rotate() {
 	}
 	if os.Rename(r.cfg.Path, name) == nil {
 		select {
-		case r.work <- name:
-		default: // maintenance is behind; the next rotation prunes this one too
+		case r.work <- struct{}{}:
+		default: // a pass is already due; it sees this file too
 		}
 	}
 	_ = r.open()
@@ -158,13 +158,19 @@ func exists(name string) bool {
 	return err == nil
 }
 
-// maintain compresses and prunes rotated files, in order.
+// maintain prunes and then compresses the rotated files after each
+// rotation. Each pass looks at every rotated file, so rotations that come
+// faster than a pass are never left behind.
 func (r *Rotating) maintain() {
-	for name := range r.work {
-		if r.cfg.Compress {
-			compressFile(name, r.cfg.mode())
-		}
+	for range r.work {
 		r.prune()
+		if r.cfg.Compress {
+			for _, f := range r.rotatedFiles() {
+				if !strings.HasSuffix(f.path, ".gz") {
+					compressFile(f.path, r.cfg.mode())
+				}
+			}
+		}
 	}
 }
 
