@@ -92,7 +92,8 @@ Every encoder writes the fixed fields first, in the order `time`, `level`,
 `event`, `module`, then the line's attributes, then `msg`, `source` and
 `stack`. The text (logfmt) and JSON forms carry the same keys. Values are
 quoted and escaped so no input can forge a line: an attribute named like a
-fixed field is written as `_level`, control characters and bidi overrides
+fixed field (`time`, `level`, `event`, `module`, `msg`, `source`, `stack`,
+`suppressed`) is written with a leading `_`, such as `_source`, control characters and bidi overrides
 are escaped, a value whose `Error` or `String` panics is written as
 `!PANIC`, and `slogx.Redacted` values as `[REDACTED]` (unless `Config.LogSecrets`, a
 development-only switch that warns when it turns on, writes them as they
@@ -123,11 +124,15 @@ The package examples show each of these in runnable form.
 With a security file, a filter needs only the fixed fields:
 
 ```
-failregex = ^time=\S* level=WARN event=login_failed .*\bsrc_ip=<HOST>(\s|$)
+failregex = ^time=\S* level=WARN event=login_failed module=\S+ src_ip=<HOST>(\s|$)
 ```
 
-fail2ban strips the timestamp before matching, which leaves `time=` empty,
-hence `\S*`. An event with a `Limit` writes at most one line per key and
+Pass the address as the event's first argument. An event line writes its own
+attributes right after `module=`, ahead of those of `With`, `Config.Context`
+and `Config.Attrs`, so the filter can anchor on it. Do not match
+`.*src_ip=`: a later field the client controls, such as a user name, could
+carry `src_ip=` of an innocent address. fail2ban strips the timestamp before
+matching, which leaves `time=` empty, hence `\S*`. An event with a `Limit` writes at most one line per key and
 minute, so each line stands for at least one failure in that minute: set
 `maxretry` and `findtime` in those terms (for example 3 lines in 10m).
 

@@ -201,3 +201,48 @@ func TestSetLogSecrets(t *testing.T) {
 		t.Fatalf("lines:\n%s", text)
 	}
 }
+
+func TestConfigAttrs(t *testing.T) {
+	l := New()
+	defer l.Close()
+	if err := l.Configure(Config{Console: ConsoleOff, Memory: 8, Attrs: []slog.Attr{slog.String("instance", "a"), slog.String("source", "x")}}); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Module("net")
+	m.Info("plain", "k", 1)
+	Emit(context.Background(), m, &Def{Name: "test_attrs_event", Level: slog.LevelInfo}, "k", 2)
+	if err := l.Configure(Config{Console: ConsoleOff, Memory: 8, Attrs: []slog.Attr{slog.String("instance", "b")}}); err != nil {
+		t.Fatal(err)
+	}
+	m.Info("after")
+	text := l.Memory().Text(Query{}, TextEncoder{})
+	for _, want := range []string{"module=net k=1 instance=a _source=x", "event=test_attrs_event module=net k=2 instance=a _source=x", "module=net instance=b msg=after"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func TestEventFieldsFollowModule(t *testing.T) {
+	l := New()
+	defer l.Close()
+	if err := l.Configure(Config{
+		Console: ConsoleOff, Memory: 4,
+		Attrs:   []slog.Attr{slog.String("instance", "a")},
+		Context: func(context.Context) []slog.Attr { return []slog.Attr{slog.String("req", "r1")} },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Module("auth").With("conn", 7)
+	Emit(context.Background(), m, &Def{Name: "test_anchor", Level: slog.LevelWarn}, "src_ip", "192.0.2.1", "user", "x src_ip=198.51.100.9")
+	m.Info("plain", "k", 1)
+	text := l.Memory().Text(Query{}, TextEncoder{})
+	for _, want := range []string{
+		"event=test_anchor module=auth src_ip=192.0.2.1 user=\"x src_ip=198.51.100.9\" conn=7 req=r1 instance=a",
+		"module=auth conn=7 req=r1 k=1 instance=a msg=plain",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+}

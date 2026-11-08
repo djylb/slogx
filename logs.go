@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +83,11 @@ type Config struct {
 	// level, such as slog.LevelError. As with slog.HandlerOptions.Level, a
 	// nil pointer inside the interface is not allowed.
 	StackFrom slog.Leveler
+	// Attrs are added to every line, events included, after all its other
+	// attributes: such as instance= or host= to tell apart processes
+	// writing to one place. A key of a fixed field gets a leading "_" like
+	// any attribute's.
+	Attrs []slog.Attr
 	// Context returns attributes a context carries, such as a request id,
 	// for lines logged with one.
 	Context func(context.Context) []slog.Attr
@@ -97,9 +103,9 @@ type Logs struct {
 	attached atomic.Pointer[[]*Route]
 	// attachedBelow: an attached route sees lines below the level table.
 	attachedBelow atomic.Bool
-	sampler       sampler
 	secrets       atomic.Bool // Redacted values are written as they are
-	mu            sync.Mutex  // Configure, Close, Attach
+	sampler       sampler
+	mu            sync.Mutex // Configure, Close, Attach
 }
 
 // pipeline is one configuration, replaced whole. Lines in flight hold mu
@@ -111,6 +117,7 @@ type pipeline struct {
 	memory    *Memory
 	stackFrom slog.Leveler
 	ctxAttrs  func(context.Context) []slog.Attr
+	attrs     []slog.Attr // Config.Attrs
 	sample    *Sampling
 	closed    bool
 	below     bool // a route sees lines below the level table
@@ -181,7 +188,7 @@ func (l *Logs) Configure(c Config) error {
 			return err
 		}
 	}
-	p := &pipeline{addSource: c.AddSource, stackFrom: c.StackFrom, ctxAttrs: c.Context, sample: c.Sample}
+	p := &pipeline{addSource: c.AddSource, stackFrom: c.StackFrom, ctxAttrs: c.Context, sample: c.Sample, attrs: slices.Clone(c.Attrs)}
 	var fallback []string
 	open := func(name string, r Rotation) Output {
 		f, err := OpenRotating(r)
