@@ -25,7 +25,7 @@ func PprofLabels(ctx context.Context) []slog.Attr {
 func JoinContext(fns ...func(context.Context) []slog.Attr) func(context.Context) []slog.Attr {
 	fns = slices.DeleteFunc(slices.Clone(fns), func(f func(context.Context) []slog.Attr) bool { return f == nil })
 	return func(ctx context.Context) []slog.Attr {
-		var out []slog.Attr
+		var out []slog.Attr //nolint:prealloc // most calls add nothing; a guess at the size would allocate for them
 		for _, f := range fns {
 			out = append(out, f(ctx)...)
 		}

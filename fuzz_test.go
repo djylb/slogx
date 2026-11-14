@@ -27,6 +27,7 @@ func fuzzRecord(module, event, key, value, msg string) *Record {
 var seeds = []string{"", "plain", "a b", "x\ny", "\r\n", "q\"", "\\", "=", "level=ERROR", "\x1b[31m", "\x00", "\xff\xfe", " ", "中文", " time=x"}
 
 func addSeeds(f *testing.F) {
+	f.Helper()
 	for _, a := range seeds {
 		for _, b := range []string{"k", "", "a=b", "x\ny"} {
 			f.Add("mod", "ev", b, a, a)

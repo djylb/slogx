@@ -93,22 +93,33 @@ func parseTLSHandshake(l *slog.Logger, listener, msg string, pc uintptr) bool {
 	return true
 }
 
+// Reason values of the tls_handshake_failed event.
+const (
+	reasonEOF        = "eof"
+	reasonTimeout    = "timeout"
+	reasonBadRecord  = "bad_record"
+	reasonNoCert     = "no_cert"
+	reasonUnknownSNI = "unknown_sni"
+	reasonVersion    = "version"
+	reasonCipher     = "cipher"
+)
+
 var tlsReasons = [][2]string{
-	{"eof", "eof"},
-	{"timeout", "timeout"},
-	{"i/o timeout", "timeout"},
-	{"connection reset", "eof"},
-	{"first record does not look like", "bad_record"},
-	{"record overflow", "bad_record"},
-	{"bad record", "bad_record"},
-	{"no certificate", "no_cert"},
-	{"no certificates", "no_cert"},
-	{"unknown certificate", "no_cert"},
-	{"unrecognized name", "unknown_sni"},
-	{"server name", "unknown_sni"},
-	{"protocol version", "version"},
-	{"unsupported versions", "version"},
-	{"cipher", "cipher"},
+	{"eof", reasonEOF},
+	{"timeout", reasonTimeout},
+	{"i/o timeout", reasonTimeout},
+	{"connection reset", reasonEOF},
+	{"first record does not look like", reasonBadRecord},
+	{"record overflow", reasonBadRecord},
+	{"bad record", reasonBadRecord},
+	{"no certificate", reasonNoCert},
+	{"no certificates", reasonNoCert},
+	{"unknown certificate", reasonNoCert},
+	{"unrecognized name", reasonUnknownSNI},
+	{"server name", reasonUnknownSNI},
+	{"protocol version", reasonVersion},
+	{"unsupported versions", reasonVersion},
+	{"cipher", reasonCipher},
 }
 
 func tlsReason(s string) string {

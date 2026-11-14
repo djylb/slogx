@@ -301,13 +301,13 @@ func (r *Rotating) prune() {
 
 // compressFile writes name.gz through a temporary file, then removes name.
 func compressFile(name string, mode os.FileMode) {
-	in, err := os.Open(name)
+	in, err := os.Open(name) //nolint:gosec // name is a rotated file of this package, not input
 	if err != nil {
 		return
 	}
 	defer func() { _ = in.Close() }()
 	tmp := name + ".gz.tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, mode)
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, mode) //nolint:gosec // tmp derives from the rotated file name above
 	if err != nil {
 		return
 	}

@@ -1,12 +1,12 @@
 package slogx_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/djylb/slogx"
@@ -14,8 +14,8 @@ import (
 
 // stdout is a route that writes logfmt without the time to os.Stdout, so
 // the examples' output is stable.
-func stdout(m slogx.Match) slogx.Route {
-	return slogx.Route{Match: m, Output: slogx.WriterOutput(os.Stdout), Encoder: noTime{slogx.TextEncoder{}}}
+func stdout() slogx.Route {
+	return slogx.Route{Output: slogx.WriterOutput(os.Stdout), Encoder: noTime{slogx.TextEncoder{}}}
 }
 
 func Example() {
@@ -23,7 +23,7 @@ func Example() {
 	_ = logs.Configure(slogx.Config{
 		Console: slogx.ConsoleOff,
 		Level:   "info,db=debug",
-		Routes:  []slogx.Route{stdout(nil)},
+		Routes:  []slogx.Route{stdout()},
 	})
 	defer logs.Close()
 
@@ -39,7 +39,7 @@ func ExampleEmit() {
 	loginFailed := slogx.Def{Name: "login_failed", Level: slog.LevelWarn, Msg: "login failed", Security: true}
 
 	logs := slogx.New()
-	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Routes: []slogx.Route{stdout(nil)}})
+	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Routes: []slogx.Route{stdout()}})
 	defer logs.Close()
 
 	ctx := context.Background()
@@ -53,7 +53,7 @@ func ExampleEmit() {
 
 func ExampleLevels_Override() {
 	logs := slogx.New()
-	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "info", Routes: []slogx.Route{stdout(nil)}})
+	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "info", Routes: []slogx.Route{stdout()}})
 	defer logs.Close()
 
 	db := logs.Module("db")
@@ -111,7 +111,7 @@ func ExampleAsync() {
 
 func ExampleHTTPErrorLog() {
 	logs := slogx.New()
-	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "debug", Routes: []slogx.Route{stdout(nil)}})
+	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "debug", Routes: []slogx.Route{stdout()}})
 	defer logs.Close()
 
 	// As http.Server{ErrorLog: errLog} would write it:
@@ -132,7 +132,7 @@ func ExampleRoute() {
 	_ = logs.Configure(slogx.Config{
 		Console: slogx.ConsoleOff,
 		Level:   "warn",
-		Routes: []slogx.Route{stdout(nil), {Name: "bus", Match: slogx.MatchBus, Func: func(r *slogx.Record) {
+		Routes: []slogx.Route{stdout(), {Name: "bus", Match: slogx.MatchBus, Func: func(r *slogx.Record) {
 			fmt.Println("bus:", r.Event)
 		}}},
 	})
@@ -150,8 +150,8 @@ type noTime struct{ slogx.Encoder }
 
 func (e noTime) Encode(b []byte, r *slogx.Record) []byte {
 	line := e.Encoder.Encode(nil, r)
-	if i := strings.IndexByte(string(line), ' '); i >= 0 {
-		return append(b, line[i+1:]...)
+	if _, rest, ok := bytes.Cut(line, []byte(" ")); ok {
+		return append(b, rest...)
 	}
 	return append(b, line...)
 }

@@ -272,7 +272,12 @@ func (l *Levels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	l.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(st)
+	b, err := json.Marshal(st)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(append(b, '\n'))
 }
 
 // ParseLevel reads one level name: trace, debug, info, warn, error, off,

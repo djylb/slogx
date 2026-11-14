@@ -2,7 +2,6 @@ package slogx
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"testing"
 )
@@ -13,6 +12,7 @@ func (discard) Write([]byte) error { return nil }
 func (discard) Close() error       { return nil }
 
 func benchLogs(b *testing.B, enc Encoder) *Logs {
+	b.Helper()
 	l := New()
 	if err := l.Configure(Config{Console: ConsoleOff, Level: "info", Routes: []Route{{Encoder: enc, Output: discard{}}}}); err != nil {
 		b.Fatal(err)
@@ -64,7 +64,7 @@ func BenchmarkWithAttrs(b *testing.B) {
 }
 
 func BenchmarkStdTextHandler(b *testing.B) {
-	m := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := slog.New(slog.DiscardHandler)
 	b.ReportAllocs()
 	for b.Loop() {
 		m.Info("request done", "client", 42, "route", "tcp:8080", "dur", 1500, "ok", true)

@@ -282,7 +282,7 @@ func (l *Logs) Attach(r Route) (detach func(), err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	cur := *l.attached.Load()
-	l.attached.Store(new(append(cur[:len(cur):len(cur)], rp)))
+	l.attached.Store(new(append(slices.Clip(cur), rp)))
 	l.attachedBelow.Store(l.attachedBelow.Load() || r.Below)
 	var once sync.Once
 	return func() {

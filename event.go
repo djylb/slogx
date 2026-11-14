@@ -106,6 +106,7 @@ var (
 	tlsHandshakeFailed = Def{Name: EventTLSHandshakeFailed, Level: slog.LevelDebug, Limit: "src_ip"}
 )
 
+//nolint:gochecknoinits // the built-in events must be registered before any Logs exists, as Register requires
 func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFailed) }
 
 // Emit writes event d at its level to l with the given attributes (as
@@ -114,7 +115,12 @@ func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFail
 // ("msg", as a key-value pair or a slog.Attr), which is then not written as
 // an attribute. A security or bus event is passed on even when its level is
 // filtered out of the main log.
+//
+//nolint:contextcheck // a nil ctx is accepted, as by slog, and means context.Background
 func Emit(ctx context.Context, l *slog.Logger, d *Def, args ...any) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	emit(ctx, l, d, callerPC(2), args)
 }
 
@@ -125,9 +131,6 @@ func callerPC(skip int) uintptr {
 }
 
 func emit(ctx context.Context, l *slog.Logger, d *Def, pc uintptr, args []any) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	h := l.Handler()
 	if !d.Security && !d.Bus && !h.Enabled(ctx, d.Level) {
 		return

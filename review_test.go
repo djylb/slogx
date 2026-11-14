@@ -1,6 +1,7 @@
 package slogx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -193,13 +194,13 @@ func TestSamplerOverflowIsLimited(t *testing.T) {
 
 func itoa(i int) string { return strconv.Itoa(i) }
 
-type nilErr struct{ p *int }
+type nilError struct{ p *int }
 
-func (e *nilErr) Error() string { return "v" + itoa(*e.p) }
+func (e *nilError) Error() string { return "v" + itoa(*e.p) }
 
 func TestPanickingValueDoesNotCrash(t *testing.T) {
 	l, o := withRoute(t, Config{}, nil)
-	var e *nilErr
+	var e *nilError
 	l.Module("x").Info("m", "err", error(e))
 	if !strings.Contains(o.all(), "!PANIC") {
 		t.Fatalf("got %q", o.all())
@@ -257,7 +258,7 @@ func TestUnsafeRunesEscaped(t *testing.T) {
 	in := "a\u009b31mb\u202eevil"
 	for _, enc := range []Encoder{TextEncoder{}, JSONEncoder{}, PrettyEncoder{}} {
 		b := enc.Encode(nil, &Record{Time: time.Now(), Msg: in, Attrs: []slog.Attr{slog.String("k", in)}})
-		if strings.ContainsRune(string(b), 0x9b) || strings.ContainsRune(string(b), 0x202e) {
+		if bytes.ContainsRune(b, 0x9b) || bytes.ContainsRune(b, 0x202e) {
 			t.Fatalf("%T wrote %q", enc, b)
 		}
 	}

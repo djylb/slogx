@@ -113,7 +113,7 @@ func TestLevelsHTTP(t *testing.T) {
 	srv := httptest.NewServer(l.Levels())
 	defer srv.Close()
 	put := func(body string) int {
-		req, _ := http.NewRequest(http.MethodPut, srv.URL, strings.NewReader(body))
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPut, srv.URL, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -131,14 +131,15 @@ func TestLevelsHTTP(t *testing.T) {
 	if c := put(`{"level":"loud"}`); c != 400 {
 		t.Fatal(c)
 	}
-	resp, err := http.Get(srv.URL)
+	getReq, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	resp, err := http.DefaultClient.Do(getReq)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var st struct {
-		Level     string
-		Overrides map[string]string
+		Level     string            `json:"level"`
+		Overrides map[string]string `json:"overrides"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&st)
 	if st.Level != "info,net=debug" || !strings.HasPrefix(st.Overrides["web"], "trace until ") {

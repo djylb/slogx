@@ -153,7 +153,7 @@ type PrettyEncoder struct {
 
 // Encode implements Encoder.
 func (e PrettyEncoder) Encode(b []byte, r *Record) []byte {
-	b = r.Time.Local().AppendFormat(b, "15:04:05.000")
+	b = r.Time.Local().AppendFormat(b, "15:04:05.000") //nolint:gosmopolitan // the console shows the local time of the person at it
 	b = append(b, ' ')
 	name := LevelName(r.Level)
 	if e.Color {
@@ -234,7 +234,7 @@ func sanitize(s string) string {
 
 func sanitizeStack(s string) string {
 	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c == '\n':
@@ -252,7 +252,7 @@ func appendKey(b []byte, k string) []byte {
 	if k == "" {
 		return append(b, '_')
 	}
-	for i := 0; i < len(k); i++ {
+	for i := range len(k) {
 		c := k[i]
 		if c <= ' ' || c == '=' || c == '"' || c >= 0x7f {
 			c = '_'
@@ -354,7 +354,7 @@ func appendText(b []byte, s string) []byte {
 }
 
 func needsQuote(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c <= ' ' || c == '=' || c == '"' || c == '\\' || c >= 0x7f {
 			return true

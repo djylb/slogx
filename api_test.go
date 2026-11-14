@@ -119,7 +119,7 @@ func TestServeHTTPClearWithoutLevel(t *testing.T) {
 	if err := lv.Override("net", slog.LevelDebug, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"module":"net","ttl":"0"}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", strings.NewReader(`{"module":"net","ttl":"0"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	lv.ServeHTTP(w, req)

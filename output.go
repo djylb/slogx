@@ -55,8 +55,8 @@ func (o *writerOutput) Close() error {
 // Async returns an Output that hands lines to o on a goroutine of its own
 // through a queue of size lines. A line that does not fit is dropped and
 // counted rather than blocking the caller. Flush waits until the queue is
-// empty; Close flushes and closes o. Both wait for o, so an o that hangs
-// hangs them.
+// empty; Close flushes and closes o. Both wait for o, so if o stalls, they
+// stall too.
 func Async(o Output, size int) *AsyncOutput {
 	a := &AsyncOutput{out: o, q: make(chan asyncItem, max(size, 1)), done: make(chan struct{})}
 	go a.run()

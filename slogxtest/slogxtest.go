@@ -79,7 +79,7 @@ func (r *Recorder) Reset() {
 // TB is the part of testing.TB that ToTest uses.
 type TB interface {
 	Output() io.Writer
-	Cleanup(func())
+	Cleanup(f func())
 }
 
 // ToTest returns Logs that write every line, logfmt, to the output of t,
