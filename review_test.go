@@ -178,17 +178,50 @@ func TestOverrideBoundsAndClose(t *testing.T) {
 }
 
 func TestSamplerOverflowIsLimited(t *testing.T) {
-	var sm sampler
-	now := time.Now()
-	s := Sampling{First: 1, Tick: time.Minute}
-	passed := 0
-	for i := range maxSampleKeys + 1000 {
-		if _, ok := sm.allow("ip"+itoa(i), s, now); ok {
-			passed++
+	for _, k := range []uint{0, 4} {
+		shards := 1 << k
+		sm := newSamplerN(k)
+		now := time.Now()
+		s := Sampling{First: 1, Tick: time.Minute}
+		passed, keys := 0, 0
+		for i := range maxSampleKeys + 1000 {
+			if _, ok := sm.allow(sampleKey{a: "ip" + itoa(i)}, s, now); ok {
+				passed++
+			}
+		}
+		for i := range sm.shards {
+			if n := len(sm.shards[i].seen); n > sm.perMax+1 {
+				t.Fatalf("%d shards: shard %d holds %d keys, over %d+overflow", shards, i, n, sm.perMax)
+			}
+			keys += len(sm.shards[i].seen)
+		}
+		// every tracked key, overflow keys included, passed exactly once
+		if passed != keys || keys > maxSampleKeys+shards {
+			t.Fatalf("%d shards: passed %d with %d keys: new keys beyond the table must share one limit per shard", shards, passed, keys)
 		}
 	}
-	if passed != maxSampleKeys+1 || len(sm.seen) != maxSampleKeys+1 {
-		t.Fatalf("passed %d with %d keys: new keys beyond the table must share one limit", passed, len(sm.seen))
+}
+
+func TestSampleKeysKeepFieldsApart(t *testing.T) {
+	sm := newSamplerN(2)
+	now := time.Now()
+	s := Sampling{First: 1, Tick: time.Minute}
+	keys := []sampleKey{
+		{a: "ev"},
+		{a: "ev", field: true},
+		{a: "ev", b: "x", field: true},
+		{a: "ev\x00x"},
+		{a: "m", b: "msg", plain: true},
+		{a: "m", b: "msg", plain: true, level: slog.LevelWarn},
+		{a: "m\x00msg", plain: true},
+	}
+	for _, k := range keys {
+		if _, ok := sm.allow(k, s, now); !ok {
+			t.Fatalf("%+v shares a count with an earlier key", k)
+		}
+	}
+	if _, ok := sm.allow(keys[0], s, now); ok {
+		t.Fatal("a repeated key passed First 1 twice")
 	}
 }
 

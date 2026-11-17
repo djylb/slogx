@@ -106,9 +106,10 @@ people and not meant to be parsed.
   compression and permissions, and reopen on request for an external
   logrotate (`Logs.Reopen`); `Async` queues lines and drops instead of
   blocking, reporting what it dropped as a `log_dropped` event.
-- **Context**: `Config.Context` takes attributes from a `context.Context`,
-  such as request ids or the pprof labels a component runs under
-  (`PprofLabels`, combined with `JoinContext`).
+- **Context**: `Config.ContextAppend` appends attributes from a
+  `context.Context` into the line's own buffer, such as request ids or the
+  pprof labels a component runs under (`PprofLabels`, combined with
+  `JoinContext`).
 - **Diagnostics**: `Config.AddSource` adds `source=file:line`;
   `Config.StackFrom` adds stacks from a level.
 - **Capture**: `HTTPErrorLog` for `http.Server.ErrorLog` turns TLS handshake
@@ -128,7 +129,7 @@ failregex = ^time=\S* level=WARN event=login_failed module=\S+ src_ip=<HOST>(\s|
 ```
 
 Pass the address as the event's first argument. An event line writes its own
-attributes right after `module=`, ahead of those of `With`, `Config.Context`
+attributes right after `module=`, ahead of those of `With`, `Config.ContextAppend`
 and `Config.Attrs`, so the filter can anchor on it. Do not match
 `.*src_ip=`: a later field the client controls, such as a user name, could
 carry `src_ip=` of an innocent address. fail2ban strips the timestamp before

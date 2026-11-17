@@ -110,7 +110,7 @@ var (
 func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFailed) }
 
 // Emit writes event d at its level to l with the given attributes (as
-// slog's args), carrying the attributes of ctx (Config.Context). The line's
+// slog's args), carrying the attributes of ctx (Config.ContextAppend). The line's
 // message is d.Msg, or the value of the first argument with the key KeyMsg
 // ("msg", as a key-value pair or a slog.Attr), which is then not written as
 // an attribute. A security or bus event is passed on even when its level is

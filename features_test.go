@@ -188,11 +188,11 @@ func TestPrettyHasNoRawControl(t *testing.T) {
 
 func TestSourceAndContext(t *testing.T) {
 	type key struct{}
-	l, o := withRoute(t, Config{AddSource: true, Context: func(ctx context.Context) []slog.Attr {
+	l, o := withRoute(t, Config{AddSource: true, ContextAppend: func(ctx context.Context, dst []slog.Attr) []slog.Attr {
 		if v, ok := ctx.Value(key{}).(string); ok {
-			return []slog.Attr{slog.String("req", v)}
+			dst = append(dst, slog.String("req", v))
 		}
-		return nil
+		return dst
 	}}, nil)
 	ctx := context.WithValue(context.Background(), key{}, "r42")
 	l.Module("web").InfoContext(ctx, "handled")
@@ -262,7 +262,7 @@ func TestEventCarriesDefWithoutRegistry(t *testing.T) {
 }
 
 func TestPprofLabels(t *testing.T) {
-	l, o := withRoute(t, Config{Context: JoinContext(PprofLabels)}, nil)
+	l, o := withRoute(t, Config{ContextAppend: JoinContext(PprofLabels)}, nil)
 	pprof.Do(context.Background(), pprof.Labels("component", "relay"), func(ctx context.Context) {
 		l.Module("x").InfoContext(ctx, "m")
 	})

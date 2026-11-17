@@ -1,6 +1,7 @@
 package slogx
 
 import (
+	"context"
 	"log/slog"
 	"time"
 )
@@ -25,6 +26,10 @@ type Record struct {
 	// Config.StackFrom.
 	Stack string
 
+	// ctx is the reused buffer Config.ContextAppend appends into, kept
+	// apart from Attrs because each of its attributes is still resolved
+	// and flattened into Attrs.
+	ctx     []slog.Attr
 	secrets bool // Redacted values are written as they are
 }
 
@@ -32,6 +37,7 @@ type Record struct {
 func (r *Record) Clone() Record {
 	c := *r
 	c.Attrs = append([]slog.Attr(nil), r.Attrs...)
+	c.ctx = nil
 	return c
 }
 
@@ -95,4 +101,12 @@ func (r *Record) add(a slog.Attr, prefix string) {
 		a.Key = "_" + a.Key
 	}
 	r.Attrs = append(r.Attrs, a)
+}
+
+// addContext adds the attributes fn appends for ctx.
+func (r *Record) addContext(ctx context.Context, fn func(context.Context, []slog.Attr) []slog.Attr) {
+	r.ctx = fn(ctx, r.ctx[:0])
+	for _, a := range r.ctx {
+		r.add(a, "")
+	}
 }

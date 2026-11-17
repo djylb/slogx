@@ -7,28 +7,27 @@ import (
 	"slices"
 )
 
-// PprofLabels returns the pprof labels ctx carries as attributes, for
-// Config.Context: a component labelled for profiles and tracebacks (such
-// as with pprof.Do) then carries the same names in its log lines. Labels
-// are not secret-safe; keep secrets out of them.
-func PprofLabels(ctx context.Context) []slog.Attr {
-	var out []slog.Attr
+// PprofLabels appends the pprof labels ctx carries to dst as attributes,
+// for Config.ContextAppend: a component labelled for profiles and
+// tracebacks (such as with pprof.Do) then carries the same names in its log
+// lines. Labels are not secret-safe; keep secrets out of them.
+func PprofLabels(ctx context.Context, dst []slog.Attr) []slog.Attr {
 	pprof.ForLabels(ctx, func(k, v string) bool {
-		out = append(out, slog.String(k, v))
+		dst = append(dst, slog.String(k, v))
 		return true
 	})
-	return out
+	return dst
 }
 
-// JoinContext combines context extractors for Config.Context; the
-// attributes of each follow those of the one before.
-func JoinContext(fns ...func(context.Context) []slog.Attr) func(context.Context) []slog.Attr {
-	fns = slices.DeleteFunc(slices.Clone(fns), func(f func(context.Context) []slog.Attr) bool { return f == nil })
-	return func(ctx context.Context) []slog.Attr {
-		var out []slog.Attr //nolint:prealloc // most calls add nothing; a guess at the size would allocate for them
+// JoinContext combines context extractors for Config.ContextAppend; the
+// attributes of each follow those of the one before. Nil extractors are
+// skipped.
+func JoinContext(fns ...func(context.Context, []slog.Attr) []slog.Attr) func(context.Context, []slog.Attr) []slog.Attr {
+	fns = slices.DeleteFunc(slices.Clone(fns), func(f func(context.Context, []slog.Attr) []slog.Attr) bool { return f == nil })
+	return func(ctx context.Context, dst []slog.Attr) []slog.Attr {
 		for _, f := range fns {
-			out = append(out, f(ctx)...)
+			dst = f(ctx, dst)
 		}
-		return out
+		return dst
 	}
 }

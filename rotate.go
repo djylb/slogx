@@ -2,6 +2,7 @@ package slogx
 
 import (
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,6 +27,17 @@ type Rotation struct {
 	MaxFiles int
 	// MaxAge is how long rotated files are kept, by the time in their name.
 	MaxAge time.Duration
+	// BufferSize, when positive, collects lines in a buffer of that many
+	// bytes and writes them to the file together, instead of one write
+	// per line. The buffer is written out when the next line does not fit,
+	// FlushInterval after its first line, on Flush, Reopen, rotation and
+	// Close. Lines still in the buffer are lost if the process dies
+	// without Close. Zero or negative writes every line at once.
+	BufferSize int
+	// FlushInterval bounds how long a buffered line waits for the file;
+	// zero is one second, negative never flushes on time (only on size,
+	// Flush, Reopen, rotation and Close). Unused without BufferSize.
+	FlushInterval time.Duration
 	// Compress gzips rotated files.
 	Compress bool
 	// Mode is the permission of new log files; zero is 0640, readable by
@@ -54,18 +66,22 @@ const rotatedLayout = "20060102T150405.000"
 // pruning of rotated files run in order on one goroutine of its own, so they
 // never race each other or the writer.
 type Rotating struct {
-	mu      sync.Mutex
-	cfg     Rotation
+	f       *os.File
+	work    chan struct{} // a rotation happened: compress and prune
+	timer   *time.Timer   // writes buf out FlushInterval after its first line
+	buf     []byte        // lines not yet written, with BufferSize
 	dir     string
 	base    string // file name without ext
 	ext     string
-	f       *os.File
-	size    int64
+	cfg     Rotation
 	opened  time.Time
-	closed  bool
-	work    chan struct{} // a rotation happened: compress and prune
+	size    int64
 	workers sync.WaitGroup
+	mu      sync.Mutex
+	closed  bool
 }
+
+const defaultFlushInterval = time.Second
 
 // OpenRotating opens the file of c, creating its directory.
 func OpenRotating(c Rotation) (*Rotating, error) {
@@ -80,6 +96,9 @@ func OpenRotating(c Rotation) (*Rotating, error) {
 	r := &Rotating{cfg: c, dir: filepath.Dir(c.Path), base: strings.TrimSuffix(name, ext), ext: ext, work: make(chan struct{}, 1)}
 	if err := r.open(); err != nil {
 		return nil, err
+	}
+	if c.BufferSize > 0 {
+		r.buf = make([]byte, 0, c.BufferSize)
 	}
 	r.workers.Go(r.maintain)
 	return r, nil
@@ -99,8 +118,10 @@ func (r *Rotating) open() error {
 	return nil
 }
 
-// Write appends p to the file, rotating it first when p would take it past
-// MaxSize or the file is older than Every.
+// Write appends p to the file, or to the buffer with BufferSize, rotating
+// the file first when p would take it past MaxSize or the file is older
+// than Every. With a buffer, the error of writing earlier lines out may be
+// returned by a later Write, Flush or Close.
 func (r *Rotating) Write(p []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -112,23 +133,89 @@ func (r *Rotating) Write(p []byte) error {
 			return err
 		}
 	}
+	var err error
 	bySize := r.cfg.MaxSize > 0 && r.size > 0 && r.size+int64(len(p)) > r.cfg.MaxSize
 	byTime := r.cfg.Every > 0 && r.size > 0 && time.Since(r.opened) >= r.cfg.Every
 	if bySize || byTime {
+		// lines buffered for the old file go to it, not the new one
+		err = r.writeBuffered()
 		r.rotate()
 		if r.f == nil {
-			if err := r.open(); err != nil {
-				return err
+			if oerr := r.open(); oerr != nil {
+				return errors.Join(err, oerr)
 			}
 		}
 	}
-	n, err := r.f.Write(p)
-	r.size += int64(n)
+	if r.cfg.BufferSize <= 0 {
+		n, werr := r.f.Write(p)
+		r.size += int64(n)
+		return errors.Join(err, werr)
+	}
+	if len(r.buf)+len(p) > cap(r.buf) {
+		err = errors.Join(err, r.writeBuffered())
+	}
+	if len(p) >= cap(r.buf) {
+		n, werr := r.f.Write(p)
+		r.size += int64(n)
+		return errors.Join(err, werr)
+	}
+	if len(r.buf) == 0 {
+		r.armTimer()
+	}
+	r.buf = append(r.buf, p...)
+	r.size += int64(len(p))
 	return err
 }
 
+// writeBuffered writes the buffered lines to the file; r.mu is held. The
+// buffer is emptied even when the write fails, so a broken file cannot
+// grow it without bound.
+func (r *Rotating) writeBuffered() error {
+	if len(r.buf) == 0 {
+		return nil
+	}
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	var err error
+	if r.f != nil {
+		_, err = r.f.Write(r.buf)
+	} else {
+		err = os.ErrClosed
+	}
+	r.buf = r.buf[:0]
+	return err
+}
+
+// armTimer schedules writing out the buffer that a line is about to start;
+// r.mu is held.
+func (r *Rotating) armTimer() {
+	d := r.cfg.FlushInterval
+	if d < 0 {
+		return
+	}
+	if d == 0 {
+		d = defaultFlushInterval
+	}
+	if r.timer == nil {
+		r.timer = time.AfterFunc(d, r.flushOnTime)
+		return
+	}
+	r.timer.Reset(d)
+}
+
+// flushOnTime writes out the buffer when FlushInterval has passed. Its
+// error has no caller to go to; the next Write that fails reports one.
+func (r *Rotating) flushOnTime() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		_ = r.writeBuffered()
+	}
+}
+
 // rotate renames the current file to a name no other rotated file has and
-// starts a new one; r.mu is held.
+// starts a new one; r.mu is held and the buffer written out.
 func (r *Rotating) rotate() {
 	_ = r.f.Close()
 	r.f = nil
@@ -181,21 +268,23 @@ func (r *Rotating) Reopen() error {
 	if r.closed {
 		return os.ErrClosed
 	}
+	err := r.writeBuffered()
 	if r.f != nil {
 		_ = r.f.Close()
 	}
 	r.f = nil
-	return r.open()
+	return errors.Join(err, r.open())
 }
 
-// Flush syncs the file to disk.
+// Flush writes out the buffer and syncs the file to disk.
 func (r *Rotating) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	err := r.writeBuffered()
 	if r.f != nil {
-		return r.f.Sync()
+		err = errors.Join(err, r.f.Sync())
 	}
-	return nil
+	return err
 }
 
 // Close closes the file and waits for compression and pruning; writes
@@ -207,9 +296,12 @@ func (r *Rotating) Close() error {
 		return nil
 	}
 	r.closed = true
-	var err error
+	err := r.writeBuffered()
+	if r.timer != nil {
+		r.timer.Stop()
+	}
 	if r.f != nil {
-		err = r.f.Close()
+		err = errors.Join(err, r.f.Close())
 		r.f = nil
 	}
 	close(r.work)

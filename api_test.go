@@ -146,8 +146,8 @@ func TestEmitMsgGroupIsNotMessage(t *testing.T) {
 }
 
 func TestJoinContextSkipsNil(t *testing.T) {
-	f := JoinContext(nil, func(context.Context) []slog.Attr { return []slog.Attr{slog.Int("a", 1)} }, nil)
-	if got := f(context.Background()); len(got) != 1 || got[0].Key != "a" {
+	f := JoinContext(nil, func(_ context.Context, dst []slog.Attr) []slog.Attr { return append(dst, slog.Int("a", 1)) }, nil)
+	if got := f(context.Background(), nil); len(got) != 1 || got[0].Key != "a" {
 		t.Fatalf("JoinContext = %v", got)
 	}
 }
@@ -228,8 +228,8 @@ func TestEventFieldsFollowModule(t *testing.T) {
 	defer l.Close()
 	if err := l.Configure(Config{
 		Console: ConsoleOff, Memory: 4,
-		Attrs:   []slog.Attr{slog.String("instance", "a")},
-		Context: func(context.Context) []slog.Attr { return []slog.Attr{slog.String("req", "r1")} },
+		Attrs:         []slog.Attr{slog.String("instance", "a")},
+		ContextAppend: func(_ context.Context, dst []slog.Attr) []slog.Attr { return append(dst, slog.String("req", "r1")) },
 	}); err != nil {
 		t.Fatal(err)
 	}

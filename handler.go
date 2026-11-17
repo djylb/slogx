@@ -30,12 +30,12 @@ func (h *handler) Enabled(_ context.Context, l slog.Level) bool {
 }
 
 func (h *handler) Handle(ctx context.Context, sr slog.Record) error {
-	p := h.logs.acquire()
-	defer p.mu.RUnlock()
+	p, slot := h.logs.acquire()
+	defer p.inflight.leave(slot)
 	rp := recordPool.Get().(*Record)
 	defer putRecord(rp)
 	r := rp
-	*r = Record{Time: sr.Time, Level: sr.Level, Module: h.module, Msg: sr.Message, Attrs: r.Attrs[:0], secrets: h.logs.secrets.Load()}
+	*r = Record{Time: sr.Time, Level: sr.Level, Module: h.module, Msg: sr.Message, Attrs: r.Attrs[:0], ctx: r.ctx[:0], secrets: h.logs.secrets.Load()}
 	if r.Time.IsZero() {
 		r.Time = time.Now()
 	}
@@ -61,10 +61,8 @@ func (h *handler) Handle(ctx context.Context, sr slog.Record) error {
 	for _, a := range h.attrs {
 		r.add(a, "")
 	}
-	if p.ctxAttrs != nil && ctx != nil {
-		for _, a := range p.ctxAttrs(ctx) {
-			r.add(a, "")
-		}
+	if p.ctxAppend != nil && ctx != nil {
+		r.addContext(ctx, p.ctxAppend)
 	}
 	if !event {
 		own()
@@ -111,11 +109,12 @@ func (h *handler) WithGroup(name string) slog.Handler {
 var recordPool = sync.Pool{New: func() any { return &Record{Attrs: make([]slog.Attr, 0, 16)} }}
 
 func putRecord(r *Record) {
-	if cap(r.Attrs) > 256 {
+	if cap(r.Attrs) > 256 || cap(r.ctx) > 256 {
 		return
 	}
 	clear(r.Attrs)
-	*r = Record{Attrs: r.Attrs[:0]}
+	clear(r.ctx)
+	*r = Record{Attrs: r.Attrs[:0], ctx: r.ctx[:0]}
 	recordPool.Put(r)
 }
 

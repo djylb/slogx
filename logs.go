@@ -88,9 +88,12 @@ type Config struct {
 	// writing to one place. A key of a fixed field gets a leading "_" like
 	// any attribute's.
 	Attrs []slog.Attr
-	// Context returns attributes a context carries, such as a request id,
-	// for lines logged with one.
-	Context func(context.Context) []slog.Attr
+	// ContextAppend appends to dst the attributes a context carries, such
+	// as a request id, for lines logged with one, and returns the extended
+	// slice, as append does. dst belongs to the line being written: append
+	// to it, do not keep it. Appending into the line's own buffer lets an
+	// extractor run without allocating.
+	ContextAppend func(ctx context.Context, dst []slog.Attr) []slog.Attr
 	// Sample, when set, samples plain lines (not events) per module,
 	// level and message.
 	Sample *Sampling
@@ -108,30 +111,36 @@ type Logs struct {
 	mu            sync.Mutex // Configure, Close, Attach
 }
 
-// pipeline is one configuration, replaced whole. Lines in flight hold mu
-// for reading; the pipeline is closed only once they are done.
+// pipeline is one configuration, replaced whole. Lines in flight are
+// counted in inflight; the pipeline's outputs close only once they are
+// done.
 type pipeline struct {
 	routes    []Route
 	closers   []Output
-	mu        sync.RWMutex
+	inflight  inflight
 	memory    *Memory
 	stackFrom slog.Leveler
-	ctxAttrs  func(context.Context) []slog.Attr
+	ctxAppend func(context.Context, []slog.Attr) []slog.Attr
 	attrs     []slog.Attr // Config.Attrs
 	sample    *Sampling
-	closed    bool
 	below     bool // a route sees lines below the level table
 	addSource bool
 }
 
+func newPipeline() *pipeline {
+	return &pipeline{inflight: inflight{stripes: make([]inflightStripe, stripeCount())}}
+}
+
 func consolePipeline() *pipeline {
-	return &pipeline{routes: []Route{{Name: "console", Output: WriterOutput(os.Stderr)}}}
+	p := newPipeline()
+	p.routes = []Route{{Name: "console", Output: WriterOutput(os.Stderr)}}
+	return p
 }
 
 // New returns Logs that write logfmt at info level to stderr until
 // Configure.
 func New() *Logs {
-	l := &Logs{levels: newLevels()}
+	l := &Logs{levels: newLevels(), sampler: newSampler()}
 	l.pipe.Store(consolePipeline())
 	l.attached.Store(new([]*Route{}))
 	return l
@@ -188,7 +197,8 @@ func (l *Logs) Configure(c Config) error {
 			return err
 		}
 	}
-	p := &pipeline{addSource: c.AddSource, stackFrom: c.StackFrom, ctxAttrs: c.Context, sample: c.Sample, attrs: slices.Clone(c.Attrs)}
+	p := newPipeline()
+	p.addSource, p.stackFrom, p.ctxAppend, p.sample, p.attrs = c.AddSource, c.StackFrom, c.ContextAppend, c.Sample, slices.Clone(c.Attrs)
 	var fallback []string
 	open := func(name string, r Rotation) Output {
 		f, err := OpenRotating(r)
@@ -260,9 +270,7 @@ func (l *Logs) Configure(c Config) error {
 // retire waits for the lines in flight on p, then closes its outputs, and
 // its Memory unless it lives on in keep.
 func retire(p *pipeline, keep *Memory) {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
+	p.inflight.close()
 	for _, o := range p.closers {
 		_ = o.Close()
 	}
@@ -342,15 +350,15 @@ func (l *Logs) enabled(module string, lv slog.Level) bool {
 	return lv >= l.levels.Of(module)
 }
 
-// acquire returns the current pipeline, held for reading until release.
-func (l *Logs) acquire() *pipeline {
+// acquire returns the current pipeline, held until p.inflight.leave(slot).
+// A pipeline found closed has already been replaced, so the next load
+// finds its successor.
+func (l *Logs) acquire() (*pipeline, uint32) {
 	for {
 		p := l.pipe.Load()
-		p.mu.RLock()
-		if !p.closed {
-			return p
+		if slot, ok := p.inflight.enter(); ok {
+			return p, slot
 		}
-		p.mu.RUnlock()
 	}
 }
 
@@ -360,7 +368,7 @@ var bufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }
 func (l *Logs) dispatch(p *pipeline, r *Record) {
 	if d := r.Def; d != nil {
 		if s, field, ok := d.sampling(); ok {
-			n, pass := l.sampler.allow(sampleKey(r, field), s, r.Time)
+			n, pass := l.sampler.allow(keyOf(r, field), s, r.Time)
 			if !pass {
 				return
 			}
@@ -369,7 +377,7 @@ func (l *Logs) dispatch(p *pipeline, r *Record) {
 			}
 		}
 	} else if p.sample != nil {
-		n, pass := l.sampler.allow(sampleKey(r, ""), *p.sample, r.Time)
+		n, pass := l.sampler.allow(keyOf(r, ""), *p.sample, r.Time)
 		if !pass {
 			return
 		}
@@ -389,6 +397,12 @@ func (l *Logs) dispatch(p *pipeline, r *Record) {
 			rt.deliver(r, bp)
 		}
 	}
+	putBuf(bp)
+}
+
+// putBuf returns bp to bufPool, unless a huge line grew it: keeping that
+// would pin its memory for every later small line.
+func putBuf(bp *[]byte) {
 	if cap(*bp) <= 64<<10 {
 		bufPool.Put(bp)
 	}

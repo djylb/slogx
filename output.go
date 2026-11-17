@@ -80,7 +80,7 @@ type AsyncOutput struct {
 }
 
 type asyncItem struct {
-	line  []byte
+	line  *[]byte // from bufPool, returned once written
 	flush chan struct{}
 }
 
@@ -93,7 +93,8 @@ func (a *AsyncOutput) run() {
 			}
 			close(it.flush)
 		} else {
-			_ = a.out.Write(it.line)
+			_ = a.out.Write(*it.line)
+			putBuf(it.line)
 		}
 		if len(a.q) == 0 && a.OnDrop != nil {
 			if n := a.dropped.Load(); n > a.reported {
@@ -104,16 +105,24 @@ func (a *AsyncOutput) run() {
 	}
 }
 
-// Write queues a copy of p, or drops it when the queue is full.
+// Write queues a copy of p, in a buffer reused once the line is written,
+// or drops it when the queue is full.
 func (a *AsyncOutput) Write(p []byte) error {
 	a.closeMu.RLock()
 	defer a.closeMu.RUnlock()
 	if a.closed {
 		return os.ErrClosed
 	}
+	if len(a.q) == cap(a.q) { // full: drop without copying
+		a.dropped.Add(1)
+		return nil
+	}
+	bp := bufPool.Get().(*[]byte)
+	*bp = append((*bp)[:0], p...)
 	select {
-	case a.q <- asyncItem{line: append([]byte(nil), p...)}:
+	case a.q <- asyncItem{line: bp}:
 	default:
+		putBuf(bp)
 		a.dropped.Add(1)
 	}
 	return nil
