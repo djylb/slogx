@@ -441,3 +441,39 @@ func TestRotatingTimedFlushErrorIsReturned(t *testing.T) {
 		}
 	})
 }
+
+// TestSamplerGrowthMergesOverflow fills two shards past their share, so
+// each holds an overflow slot, then grows: the suppressed counts of both
+// must survive in the one overflow slot of the new generation.
+func TestSamplerGrowthMergesOverflow(t *testing.T) {
+	sm := newSamplerN(1)
+	now := time.Now()
+	s := Sampling{First: 1}
+	for i := range 20000 {
+		sm.allow(sampleKey{a: itoa(i)}, s, now)
+	}
+	overflow := func(set *sampleSet) (slots int, suppressed uint64) {
+		for i := range set.shards {
+			if sl, ok := set.shards[i].seen[sampleKey{overflow: true}]; ok {
+				slots++
+				suppressed += sl.suppressed
+			}
+		}
+		return slots, suppressed
+	}
+	set := sm.set.Load()
+	slots, before := overflow(set)
+	if slots != 2 || before == 0 {
+		t.Fatalf("setup: %d overflow slots, %d suppressed", slots, before)
+	}
+	for i := range set.shards {
+		set.shards[i].mu.Lock()
+	}
+	sm.growLocked(set)
+	for i := range set.shards {
+		set.shards[i].mu.Unlock()
+	}
+	if slots, after := overflow(sm.set.Load()); slots != 1 || after != before {
+		t.Fatalf("after growth %d overflow slots, %d suppressed, want 1 and %d", slots, after, before)
+	}
+}

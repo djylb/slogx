@@ -160,6 +160,16 @@ func (sm *sampler) growLocked(set *sampleSet) {
 			if dst.seen == nil {
 				dst.seen = map[sampleKey]*sampleSlot{}
 			}
+			if old, ok := dst.seen[key]; ok {
+				// only the overflow key is in several old shards: merge
+				// so no suppressed line goes unreported
+				old.suppressed += sl.suppressed
+				old.n = max(old.n, sl.n)
+				if sl.start.Before(old.start) {
+					old.start = sl.start
+				}
+				continue
+			}
 			dst.seen[key] = sl
 		}
 	}
