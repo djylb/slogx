@@ -181,6 +181,7 @@ func TestSamplerOverflowIsLimited(t *testing.T) {
 	for _, k := range []uint{0, 4} {
 		shards := 1 << k
 		sm := newSamplerN(k)
+		set := sm.set.Load()
 		now := time.Now()
 		s := Sampling{First: 1, Tick: time.Minute}
 		passed, keys := 0, 0
@@ -189,11 +190,11 @@ func TestSamplerOverflowIsLimited(t *testing.T) {
 				passed++
 			}
 		}
-		for i := range sm.shards {
-			if n := len(sm.shards[i].seen); n > sm.perMax+1 {
-				t.Fatalf("%d shards: shard %d holds %d keys, over %d+overflow", shards, i, n, sm.perMax)
+		for i := range set.shards {
+			if n := len(set.shards[i].seen); n > set.perMax+1 {
+				t.Fatalf("%d shards: shard %d holds %d keys, over %d+overflow", shards, i, n, set.perMax)
 			}
-			keys += len(sm.shards[i].seen)
+			keys += len(set.shards[i].seen)
 		}
 		// every tracked key, overflow keys included, passed exactly once
 		if passed != keys || keys > maxSampleKeys+shards {

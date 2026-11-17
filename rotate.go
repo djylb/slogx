@@ -70,6 +70,7 @@ type Rotating struct {
 	work    chan struct{} // a rotation happened: compress and prune
 	timer   *time.Timer   // writes buf out FlushInterval after its first line
 	buf     []byte        // lines not yet written, with BufferSize
+	late    error         // a timed flush failed; the next call returns it
 	dir     string
 	base    string // file name without ext
 	ext     string
@@ -120,11 +121,23 @@ func (r *Rotating) open() error {
 
 // Write appends p to the file, or to the buffer with BufferSize, rotating
 // the file first when p would take it past MaxSize or the file is older
-// than Every. With a buffer, the error of writing earlier lines out may be
-// returned by a later Write, Flush or Close.
+// than Every. With a buffer, the error of writing earlier lines out,
+// including by the FlushInterval timer, is returned by the next Write,
+// Flush or Close.
 func (r *Rotating) Write(p []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return errors.Join(r.takeLate(), r.write(p))
+}
+
+// takeLate returns and clears the error of a timed flush; r.mu is held.
+func (r *Rotating) takeLate() error {
+	err := r.late
+	r.late = nil
+	return err
+}
+
+func (r *Rotating) write(p []byte) error {
 	if r.closed {
 		return os.ErrClosed
 	}
@@ -205,12 +218,12 @@ func (r *Rotating) armTimer() {
 }
 
 // flushOnTime writes out the buffer when FlushInterval has passed. Its
-// error has no caller to go to; the next Write that fails reports one.
+// error has no caller, so it is kept for the next Write, Flush or Close.
 func (r *Rotating) flushOnTime() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.closed {
-		_ = r.writeBuffered()
+		r.late = errors.Join(r.late, r.writeBuffered())
 	}
 }
 
@@ -280,7 +293,7 @@ func (r *Rotating) Reopen() error {
 func (r *Rotating) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	err := r.writeBuffered()
+	err := errors.Join(r.takeLate(), r.writeBuffered())
 	if r.f != nil {
 		err = errors.Join(err, r.f.Sync())
 	}
@@ -296,7 +309,7 @@ func (r *Rotating) Close() error {
 		return nil
 	}
 	r.closed = true
-	err := r.writeBuffered()
+	err := errors.Join(r.takeLate(), r.writeBuffered())
 	if r.timer != nil {
 		r.timer.Stop()
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"testing"
 )
 
@@ -87,3 +89,26 @@ func BenchmarkParallelBufferedFile(b *testing.B) {
 		}
 	})
 }
+
+// benchSampledKeys spreads Limit-sampled events over n src_ip values.
+func benchSampledKeys(b *testing.B, n int) {
+	b.Helper()
+	m := benchLogs(b, TextEncoder{}).Module("x")
+	ips := make([]string, n)
+	for i := range ips {
+		ips[i] = "198.51." + strconv.Itoa(i>>8) + "." + strconv.Itoa(i&255)
+	}
+	var next atomic.Int64
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := int(next.Add(1)) * 7919
+		for pb.Next() {
+			i = (i + 1) % n
+			Emit(context.Background(), m, &testLimit, "src_ip", ips[i])
+		}
+	})
+}
+
+func BenchmarkParallelSampled10Keys(b *testing.B) { benchSampledKeys(b, 10) }
+func BenchmarkParallelSampled1MKeys(b *testing.B) { benchSampledKeys(b, 1<<20) }

@@ -2,10 +2,13 @@ package slogx
 
 import (
 	"context"
+	"hash/maphash"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -282,4 +285,159 @@ func TestKeyOfKeepsLinesApart(t *testing.T) {
 	if ev(slog.String("ip", "a")) != ev(slog.String("ip", "a"), slog.Int("n", 1)) {
 		t.Fatal("an attribute other than the Limit field changed the key")
 	}
+}
+
+func TestInflightGrowsAndCloseSeesEverySet(t *testing.T) {
+	var f inflight
+	var held []*atomic.Int64
+	for gen := range 3 { // lines in the counter and in each stripe set
+		for range 4 {
+			c, _ := f.enter()
+			held = append(held, c)
+		}
+		if gen < 2 {
+			for range growAfter {
+				f.collided()
+			}
+		}
+	}
+	if s := f.stripes.Load(); maxStripes() >= 4 && (s == nil || len(s.c) != 4 || s.prev == nil) {
+		t.Fatal("no growth after collisions")
+	}
+	done := make(chan struct{})
+	go func() { f.close(); close(done) }()
+	// the base counter, then the newest set: the oldest set alone must
+	// still hold close
+	held = slices.Concat(held[:4], held[8:], held[4:8])
+	for _, c := range held {
+		select {
+		case <-done:
+			t.Fatal("close returned while lines were in flight")
+		case <-time.After(5 * time.Millisecond):
+		}
+		f.leave(c)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close did not return")
+	}
+}
+
+func TestInflightQuietStaysSingle(t *testing.T) {
+	p := newPipeline()
+	for range 1000 {
+		c, _ := p.inflight.enter()
+		p.inflight.leave(c)
+	}
+	if p.inflight.stripes.Load() != nil {
+		t.Fatal("an uncontended pipeline grew stripes")
+	}
+}
+
+func TestSamplerGrowsKeepingCounts(t *testing.T) {
+	if maxStripes() < 2 {
+		t.Skip("one P: never grows")
+	}
+	sm := newSamplerN(0)
+	now := time.Now()
+	s := Sampling{First: 1, Tick: time.Minute}
+	for i := range 16 {
+		sm.allow(sampleKey{a: itoa(i)}, s, now)
+	}
+	sm.grow(sm.set.Load())
+	set := sm.set.Load()
+	if len(set.shards) != 2 {
+		t.Fatalf("%d shards after growth", len(set.shards))
+	}
+	for i := range 16 {
+		if _, ok := sm.allow(sampleKey{a: itoa(i)}, s, now); ok {
+			t.Fatalf("key %d lost its count in the move", i)
+		}
+	}
+	hot := newSamplerN(0)
+	hot.allow(sampleKey{a: "one"}, s, now)
+	hot.grow(hot.set.Load())
+	if len(hot.set.Load().shards) != 1 {
+		t.Fatal("a sampler of one key split")
+	}
+}
+
+func TestSamplerGrowsUnderContention(t *testing.T) {
+	if maxStripes() < 2 {
+		t.Skip("one P: never grows")
+	}
+	sm := newSamplerN(0)
+	now := time.Now()
+	s := Sampling{First: 1, Tick: time.Minute}
+	for i := range 64 {
+		sm.allow(sampleKey{a: itoa(i)}, s, now)
+	}
+	set := sm.set.Load()
+	sh := &set.shards[0]
+	sh.mu.Lock()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		sm.allow(sampleKey{a: "late"}, s, now) // waits on the held lock while the set moves
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for sm.collisions.Load() == 0 { // the line found the lock held
+		if time.Now().After(deadline) {
+			sh.mu.Unlock()
+			t.Fatal("the line never waited")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	sm.growLocked(set)
+	sh.mu.Unlock()
+	<-finished
+	sm.collisions.Store(growAfter - 1) // the next wait makes it grow by itself
+	set = sm.set.Load()
+	key := sampleKey{a: "0"}
+	sh = &set.shards[maphash.Comparable(sm.seed, key)&set.mask] // the shard the line will wait on
+	sh.mu.Lock()
+	grown := make(chan struct{})
+	go func() {
+		defer close(grown)
+		sm.allow(key, s, now)
+	}()
+	for sm.collisions.Load() != 0 { // reset once the line decided to grow
+		if time.Now().After(deadline) {
+			sh.mu.Unlock()
+			t.Fatal("a line waiting on the lock never decided to grow")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	sh.mu.Unlock()
+	<-grown
+	if maxStripes() >= 4 && len(sm.set.Load().shards) != 4 {
+		t.Fatalf("%d shards after contention", len(sm.set.Load().shards))
+	}
+
+	if _, ok := sm.allow(sampleKey{a: "late"}, s, now); ok {
+		t.Fatal("the line that waited out the growth counted in the old shards")
+	}
+}
+
+func TestRotatingTimedFlushErrorIsReturned(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, err := OpenRotating(Rotation{Path: filepath.Join(t.TempDir(), "a.log"), BufferSize: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = r.Close() }()
+		_ = r.Write([]byte("x\n"))
+		r.mu.Lock()
+		_ = r.f.Close() // the timed flush will fail
+		r.mu.Unlock()
+		time.Sleep(defaultFlushInterval)
+		synctest.Wait()
+		if err := r.Write([]byte("y\n")); err == nil {
+			t.Fatal("the timed flush's error was lost")
+		}
+		if err := r.Write([]byte("z\n")); err != nil {
+			t.Fatalf("the error was returned twice: %v", err)
+		}
+	})
 }

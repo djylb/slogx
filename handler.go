@@ -30,8 +30,8 @@ func (h *handler) Enabled(_ context.Context, l slog.Level) bool {
 }
 
 func (h *handler) Handle(ctx context.Context, sr slog.Record) error {
-	p, slot := h.logs.acquire()
-	defer p.inflight.leave(slot)
+	p, c := h.logs.acquire()
+	defer p.inflight.leave(c)
 	rp := recordPool.Get().(*Record)
 	defer putRecord(rp)
 	r := rp

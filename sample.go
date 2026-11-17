@@ -5,6 +5,7 @@ import (
 	"hash/maphash"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,10 +14,11 @@ import (
 // next line that passes carries suppressed=<count>. Zero Tick is one
 // minute. Def.Limit is the special case First 1, Thereafter 0.
 //
-// A sampler tracks up to 8192 keys, split evenly over its shards. Beyond
-// a shard's share, lines of new keys in that shard share its overflow key,
-// so a flood of distinct keys (such as source addresses an attacker picks)
-// is limited as one key per shard.
+// A sampler tracks about 8192 keys, split evenly over its shards (one,
+// until contention makes it split). Beyond a shard's share, lines of new
+// keys in that shard share its overflow key, so a flood of distinct keys
+// (such as source addresses an attacker picks) is limited as one key per
+// shard.
 type Sampling struct {
 	First      int
 	Thereafter int
@@ -44,20 +46,30 @@ func (s Sampling) tick() time.Duration {
 // is split evenly between the shards.
 const maxSampleKeys = 8192
 
-// sampler counts per key. Its keys are spread over shards, each with its
-// own lock, so lines of different keys rarely wait for each other.
+// sampler counts per key. It starts as one shard under one lock. When lines
+// are seen waiting for a shard's lock and the keys are many enough to spread
+// (at least two per shard after the split), the shards double, up to the
+// number of Ps; one hot key never splits, as more shards could not help it.
 type sampler struct {
+	set        atomic.Pointer[sampleSet]
+	seed       maphash.Seed
+	collisions atomic.Uint32 // lock waits since the last growth
+}
+
+// sampleSet is one generation of shards. Growing locks every shard,
+// copies the slots into the next generation and marks this one moved; a
+// line that then gets a shard's lock sees moved and retries on the next.
+type sampleSet struct {
 	shards []sampleShard
-	seed   maphash.Seed
-	mask   uint64 // shard index bits: len(shards)-1
+	mask   uint64 // len(shards)-1
 	perMax int    // keys per shard
+	moved  bool   // written and read under every shard's lock
 }
 
 type sampleShard struct {
 	mu        sync.Mutex
 	seen      map[sampleKey]*sampleSlot
 	lastSweep time.Time
-	_         [64]byte // keep neighbouring shards' locks apart
 }
 
 // sampleKey identifies what a sampler counts: an event and the value of its
@@ -78,30 +90,99 @@ type sampleSlot struct {
 	suppressed uint64
 }
 
-func newSampler() sampler { return newSamplerN(stripeShift()) }
-
-// newSamplerN makes a sampler of 1<<k shards.
-func newSamplerN(k uint) sampler {
+func newSampleSet(k uint) *sampleSet {
 	n := 1 << k
-	return sampler{shards: make([]sampleShard, n), seed: maphash.MakeSeed(), mask: 1<<k - 1, perMax: max(maxSampleKeys/n, 1)}
+	return &sampleSet{shards: make([]sampleShard, n), mask: 1<<k - 1, perMax: max(maxSampleKeys/n, 1)}
+}
+
+// newSamplerN makes a sampler that starts with 1<<k shards.
+func newSamplerN(k uint) *sampler {
+	sm := &sampler{seed: maphash.MakeSeed()}
+	sm.set.Store(newSampleSet(k))
+	return sm
+}
+
+// lock returns the shard of key, locked, in the current generation.
+func (sm *sampler) lock(key sampleKey) *sampleShard {
+	h := maphash.Comparable(sm.seed, key)
+	for {
+		set := sm.set.Load()
+		sh := &set.shards[h&set.mask]
+		if !sh.mu.TryLock() {
+			if sm.collisions.Add(1) >= growAfter {
+				sm.collisions.Store(0)
+				sm.grow(set)
+				continue
+			}
+			sh.mu.Lock()
+		}
+		if !set.moved {
+			return sh
+		}
+		sh.mu.Unlock()
+	}
+}
+
+// grow replaces set by one of twice the shards, if set is still current
+// and its keys are enough to spread.
+func (sm *sampler) grow(set *sampleSet) {
+	if len(set.shards) >= maxStripes() {
+		return
+	}
+	for i := range set.shards {
+		set.shards[i].mu.Lock()
+	}
+	defer func() {
+		for i := range set.shards {
+			set.shards[i].mu.Unlock()
+		}
+	}()
+	sm.growLocked(set)
+}
+
+// growLocked is grow with every shard of set locked.
+func (sm *sampler) growLocked(set *sampleSet) {
+	keys := 0
+	for i := range set.shards {
+		keys += len(set.shards[i].seen)
+	}
+	if set.moved || sm.set.Load() != set || keys < 4*len(set.shards) {
+		return
+	}
+	k := uint(0)
+	for 1<<k < 2*len(set.shards) {
+		k++
+	}
+	next := newSampleSet(k)
+	for i := range set.shards {
+		for key, sl := range set.shards[i].seen {
+			dst := &next.shards[maphash.Comparable(sm.seed, key)&next.mask]
+			if dst.seen == nil {
+				dst.seen = map[sampleKey]*sampleSlot{}
+			}
+			dst.seen[key] = sl
+		}
+	}
+	sm.set.Store(next)
+	set.moved = true
 }
 
 // allow reports whether the line of key passes s at now, and how many
 // lines of key were suppressed before it.
 func (sm *sampler) allow(key sampleKey, s Sampling, now time.Time) (uint64, bool) {
 	tick := s.tick()
-	sh := &sm.shards[maphash.Comparable(sm.seed, key)&sm.mask]
-	sh.mu.Lock()
+	sh := sm.lock(key)
 	defer sh.mu.Unlock()
+	perMax := sm.set.Load().perMax
 	if sh.seen == nil {
 		sh.seen = map[sampleKey]*sampleSlot{}
 	}
 	sl, ok := sh.seen[key]
 	if !ok {
-		if len(sh.seen) >= sm.perMax {
+		if len(sh.seen) >= perMax {
 			sh.sweep(now)
 		}
-		if len(sh.seen) >= sm.perMax {
+		if len(sh.seen) >= perMax {
 			key = sampleKey{overflow: true}
 			sl = sh.seen[key]
 		}

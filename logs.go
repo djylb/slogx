@@ -107,7 +107,7 @@ type Logs struct {
 	// attachedBelow: an attached route sees lines below the level table.
 	attachedBelow atomic.Bool
 	secrets       atomic.Bool // Redacted values are written as they are
-	sampler       sampler
+	sampler       *sampler
 	mu            sync.Mutex // Configure, Close, Attach
 }
 
@@ -128,7 +128,7 @@ type pipeline struct {
 }
 
 func newPipeline() *pipeline {
-	return &pipeline{inflight: inflight{stripes: make([]inflightStripe, stripeCount())}}
+	return &pipeline{}
 }
 
 func consolePipeline() *pipeline {
@@ -140,7 +140,7 @@ func consolePipeline() *pipeline {
 // New returns Logs that write logfmt at info level to stderr until
 // Configure.
 func New() *Logs {
-	l := &Logs{levels: newLevels(), sampler: newSampler()}
+	l := &Logs{levels: newLevels(), sampler: newSamplerN(0)}
 	l.pipe.Store(consolePipeline())
 	l.attached.Store(new([]*Route{}))
 	return l
@@ -350,14 +350,14 @@ func (l *Logs) enabled(module string, lv slog.Level) bool {
 	return lv >= l.levels.Of(module)
 }
 
-// acquire returns the current pipeline, held until p.inflight.leave(slot).
+// acquire returns the current pipeline, held until p.inflight.leave(c).
 // A pipeline found closed has already been replaced, so the next load
 // finds its successor.
-func (l *Logs) acquire() (*pipeline, uint32) {
+func (l *Logs) acquire() (*pipeline, *atomic.Int64) {
 	for {
 		p := l.pipe.Load()
-		if slot, ok := p.inflight.enter(); ok {
-			return p, slot
+		if c, ok := p.inflight.enter(); ok {
+			return p, c
 		}
 	}
 }
