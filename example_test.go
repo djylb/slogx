@@ -25,7 +25,7 @@ func Example() {
 		Level:   "info,db=debug",
 		Routes:  []slogx.Route{stdout()},
 	})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	logs.Module("web").Info("listening", "addr", ":8080")
 	logs.Module("db").Debug("query", "rows", 3)
@@ -40,7 +40,7 @@ func ExampleEmit() {
 
 	logs := slogx.New()
 	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Routes: []slogx.Route{stdout()}})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	ctx := context.Background()
 	web := logs.Module("web")
@@ -54,7 +54,7 @@ func ExampleEmit() {
 func ExampleLevels_Override() {
 	logs := slogx.New()
 	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "info", Routes: []slogx.Route{stdout()}})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	db := logs.Module("db")
 	db.Debug("before")
@@ -69,7 +69,7 @@ func ExampleLevels_Override() {
 func ExampleMemory_Subscribe() {
 	logs := slogx.New()
 	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Memory: 100})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	sub := logs.Memory().Subscribe(context.Background(), slogx.Query{MinLevel: slog.LevelWarn}, 16)
 	defer sub.Close()
@@ -81,7 +81,7 @@ func ExampleMemory_Subscribe() {
 	// WARN web slow request ms 900
 }
 
-func ExampleAsync() {
+func ExampleConfig_async() {
 	dir, _ := os.MkdirTemp("", "slogx-example")
 	defer func() { _ = os.RemoveAll(dir) }()
 	path := filepath.Join(dir, "app.log")
@@ -93,15 +93,15 @@ func ExampleAsync() {
 		fmt.Println(err)
 		return
 	}
-	out := slogx.Async(f, 1024)
 	logs := slogx.New()
 	_ = logs.Configure(slogx.Config{
 		Console: slogx.ConsoleOff,
-		Routes:  []slogx.Route{{Output: out, Encoder: noTime{slogx.TextEncoder{}}}},
+		Async:   1024,
+		Routes:  []slogx.Route{{Output: f, Encoder: noTime{slogx.TextEncoder{}}}},
 	})
 	logs.Module("app").Info("started")
-	logs.Close()
-	_ = out.Close() // a route's Output is its owner's to close: this writes the queue and closes f
+	_ = logs.Close()
+	_ = f.Close() // the route owner closes the file after Logs.Close drains the queue
 
 	b, _ := os.ReadFile(path)
 	fmt.Print(string(b))
@@ -112,7 +112,7 @@ func ExampleAsync() {
 func ExampleHTTPErrorLog() {
 	logs := slogx.New()
 	_ = logs.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "debug", Routes: []slogx.Route{stdout()}})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	// As http.Server{ErrorLog: errLog} would write it:
 	errLog := slogx.HTTPErrorLog(logs.Module("web"), "https")
@@ -136,7 +136,7 @@ func ExampleRoute() {
 			fmt.Println("bus:", r.Event)
 		}}},
 	})
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	slogx.Emit(context.Background(), logs.Module("auth"), &keyRevoked, "key", "k1")
 	logs.Module("auth").Warn("clock skew")

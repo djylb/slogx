@@ -69,7 +69,7 @@ func TestAttachedBusRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	Emit(context.Background(), l.Module("x"), &testQuiet, "a", 2)
-	detach()
+	_ = detach()
 	Emit(context.Background(), l.Module("x"), &testQuiet, "a", 3)
 	if len(got) != 2 || got[0] != "test_quiet_bus" {
 		t.Fatalf("attached route got %v", got)
@@ -113,7 +113,7 @@ func TestSecurityFileAndJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	Emit(context.Background(), l.Module("auth"), &testAuth, "src_ip", "9.9.9.9")
-	l.Close()
+	_ = l.Close()
 	sec, _ := os.ReadFile(filepath.Join(dir, "sec.log"))
 	main, _ := os.ReadFile(filepath.Join(dir, "a.log"))
 	if !strings.Contains(string(sec), `"level":"WARN","event":"test_auth_failed","module":"auth","src_ip":"9.9.9.9"}`) {
@@ -147,7 +147,7 @@ func TestRotation(t *testing.T) {
 		_ = r.Write(line)
 	}
 	_ = r.Close()
-	m, _ := filepath.Glob(filepath.Join(dir, "n-*.log"))
+	m, _ := filepath.Glob(filepath.Join(dir, archiveRoot, "n.log", "*"))
 	if len(m) > 2 || len(m) == 0 {
 		t.Fatalf("rotated files %v", m)
 	}

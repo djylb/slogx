@@ -88,7 +88,7 @@ restart.
 
 ## Format
 
-Every encoder writes the fixed fields first, in the order `time`, `level`,
+Text and JSON write the fixed fields first, in the order `time`, `level`,
 `event`, `module`, then the line's attributes, then `msg`, `source` and
 `stack`. The text (logfmt) and JSON forms carry the same keys. Values are
 quoted and escaped so no input can forge a line: an attribute named like a
@@ -103,9 +103,9 @@ people and not meant to be parsed.
 ## More
 
 - **Outputs**: files that rotate by size or age, with retention,
-  compression and permissions, and reopen on request for an external
-  logrotate (`Logs.Reopen`); `Async` queues lines and drops instead of
-  blocking, reporting what it dropped as a `log_dropped` event.
+  compression and permissions. After external rotation, `Logs.Reopen`
+  follows each configured path again. Managed queues report dropped lines in a
+  `log_dropped` event.
 - **Context**: `Config.ContextAppend` appends attributes from a
   `context.Context` into the line's own buffer, such as request ids or the
   pprof labels a component runs under (`PprofLabels`, combined with
@@ -115,12 +115,40 @@ people and not meant to be parsed.
 - **Capture**: `HTTPErrorLog` for `http.Server.ErrorLog` turns TLS handshake
   errors into `tls_handshake_failed` events; `StdLogger` and
   `CaptureStdLog` take lines of the standard `log` package.
-- **Cost**: a disabled level costs one atomic load; an enabled line does
-  not allocate.
+- **Cost**: pooled text and JSON logging with scalar fields and prebound
+  groups is allocation-free after warm-up. Memory history and subscription
+  copies, stack and source capture, dynamic group keys and custom values
+  can allocate.
+- Each byte output uses a bounded queue (1024 lines by default).
+  `Flush` waits for preceding writes. `Close` also removes attached routes.
+  Removal, Flush and Reopen wait for earlier retirements. Each operation
+  returns its own output errors. A Configure error matching `ErrRetirement`
+  means the replacement is active. After a route is removed and drained,
+  its owner can close its output.
+  An explicit `*AsyncOutput` supplies its own queue, drop counter and
+  callback. Its next barrier or close returns pending write errors. Logs
+  flushes it on removal. `Logs.Dropped` counts managed queue losses per
+  destination. To change a live rotation policy, remove the path,
+  wait for retirement, then configure the new policy.
+  Match functions, encoders and route callbacks run on the logging goroutine.
+  Invoke blocking lifecycle operations outside callbacks on the same Logs.
+- Operational notices go directly to stderr and to the configured memory
+  viewer, including at level off. File-open failures retain the file route's
+  filter on stderr. Compatible rotations of the same file share a writer.
+  Conflicting active rotation policies return a configuration error.
+- Archives live in `.slogx-archives/<full filename>/` beside the target
+  file. Their names are UTC timestamps with an optional sequence number and
+  gzip suffix. This directory is reserved for rotation. Existing archives
+  beside the log stay in place. To include one in retention, confirm which
+  log owns it and move it into that log's archive directory using
+  `YYYYMMDDTHHMMSS.mmm[-N][.gz]` while the writer is closed.
+- Declare event definitions and their sampling policies as immutable.
+  Use `Module` to set the module. Attributes supplied with `With` follow
+  the same reserved-key rules as inline attributes.
 
 The package examples show each of these in runnable form.
 
-## fail2ban
+## Filtering security events
 
 With a security file, a filter needs only the fixed fields:
 
@@ -132,10 +160,10 @@ Pass the address as the event's first argument. An event line writes its own
 attributes right after `module=`, ahead of those of `With`, `Config.ContextAppend`
 and `Config.Attrs`, so the filter can anchor on it. Do not match
 `.*src_ip=`: a later field the client controls, such as a user name, could
-carry `src_ip=` of an innocent address. fail2ban strips the timestamp before
-matching, which leaves `time=` empty, hence `\S*`. An event with a `Limit` writes at most one line per key and
-minute, so each line stands for at least one failure in that minute: set
-`maxretry` and `findtime` in those terms (for example 3 lines in 10m).
+carry `src_ip=` of an innocent address. The pattern also accepts an empty
+`time=` when a filter strips the timestamp before matching. An event with
+a `Limit` writes at most one line per key and minute. Set retry limits
+and observation windows in those terms (for example, three lines in ten minutes).
 
 ## License
 

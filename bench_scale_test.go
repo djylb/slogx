@@ -42,7 +42,14 @@ func benchFile(b *testing.B, c Config) *slog.Logger {
 	if err := l.Configure(c); err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(l.Close)
+	b.Cleanup(func() {
+		if err := l.Close(); err != nil {
+			b.Error(err)
+		}
+		dropped := l.Dropped()
+		b.ReportMetric(float64(dropped), "dropped")
+		b.ReportMetric(float64(b.N)-float64(dropped), "written")
+	})
 	return l.Module("x")
 }
 

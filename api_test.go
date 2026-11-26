@@ -28,8 +28,8 @@ func TestRegisteredHasBuiltins(t *testing.T) {
 }
 
 func TestMatchAnyAll(t *testing.T) {
-	yes := func(*Record, *Levels) bool { return true }
-	no := func(*Record, *Levels) bool { return false }
+	yes := func(*Record, *LevelView) bool { return true }
+	no := func(*Record, *LevelView) bool { return false }
 	r := &Record{}
 	for _, c := range []struct {
 		name string
@@ -57,11 +57,13 @@ func TestCaptureStdLog(t *testing.T) {
 		log.SetPrefix(prefix)
 	}()
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, Memory: 4}); err != nil {
 		t.Fatal(err)
 	}
-	CaptureStdLog(l.Module("lib"), slog.LevelError)
+	if err := CaptureStdLog(l.Module("lib"), slog.LevelError); err != nil {
+		t.Fatal(err)
+	}
 	log.Print("from log")
 	es := l.Memory().Take()
 	if len(es) != 1 || es[0].Msg != "from log" || es[0].Level != slog.LevelError || es[0].Module != "lib" {
@@ -71,11 +73,11 @@ func TestCaptureStdLog(t *testing.T) {
 
 func TestOverrideAfterCloseAndConfigure(t *testing.T) {
 	l := New()
-	l.Close()
+	_ = l.Close()
 	if err := l.Configure(Config{Console: ConsoleOff}); err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Levels().Override("net", slog.LevelDebug, time.Minute); err != nil {
 		t.Fatalf("Override after Close and Configure: %v", err)
 	}
@@ -83,7 +85,7 @@ func TestOverrideAfterCloseAndConfigure(t *testing.T) {
 
 func TestOverrideFreesExpiredSlot(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, MaxOverrides: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +105,7 @@ func TestOverrideFreesExpiredSlot(t *testing.T) {
 
 func TestNegativeMaxOverrides(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, MaxOverrides: -1}); err == nil {
 		t.Fatal("Configure accepted a negative MaxOverrides")
 	}
@@ -111,7 +113,7 @@ func TestNegativeMaxOverrides(t *testing.T) {
 
 func TestServeHTTPClearWithoutLevel(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff}); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestServeHTTPClearWithoutLevel(t *testing.T) {
 
 func TestEmitMsgGroupIsNotMessage(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, Memory: 4}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +156,7 @@ func TestJoinContextSkipsNil(t *testing.T) {
 
 func TestLogSecrets(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	cfg := Config{Console: ConsoleOff, Memory: 8}
 	if err := l.Configure(cfg); err != nil {
 		t.Fatal(err)
@@ -186,7 +188,7 @@ func TestLogSecrets(t *testing.T) {
 
 func TestSetLogSecrets(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, Memory: 8}); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +206,7 @@ func TestSetLogSecrets(t *testing.T) {
 
 func TestConfigAttrs(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, Memory: 8, Attrs: []slog.Attr{slog.String("instance", "a"), slog.String("source", "x")}}); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +227,7 @@ func TestConfigAttrs(t *testing.T) {
 
 func TestEventFieldsFollowModule(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{
 		Console: ConsoleOff, Memory: 4,
 		Attrs:         []slog.Attr{slog.String("instance", "a")},

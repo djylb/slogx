@@ -29,7 +29,7 @@ var seeds = []string{"", "plain", "a b", "x\ny", "\r\n", "q\"", "\\", "=", "leve
 func addSeeds(f *testing.F) {
 	f.Helper()
 	for _, a := range seeds {
-		for _, b := range []string{"k", "", "a=b", "x\ny"} {
+		for _, b := range []string{"k", KeyLevel, KeyTime, KeyModule, KeyMsg, KeySuppressed, "", "a=b", "x\ny"} {
 			f.Add("mod", "ev", b, a, a)
 		}
 	}
@@ -94,14 +94,12 @@ func FuzzJSONValid(f *testing.F) {
 	})
 }
 
-// FuzzPrettyClean: the terminal form is one line (stack aside) and carries
+// FuzzPrettyClean: the terminal form is one line including its stack and carries
 // no escape or control character from the input.
 func FuzzPrettyClean(f *testing.F) {
 	addSeeds(f)
 	f.Fuzz(func(t *testing.T, module, event, key, value, msg string) {
-		r := fuzzRecord(module, event, key, value, msg)
-		r.Stack = ""
-		b := PrettyEncoder{}.Encode(nil, r)
+		b := PrettyEncoder{}.Encode(nil, fuzzRecord(module, event, key, value, msg))
 		if bytes.IndexByte(b, '\n') != len(b)-1 {
 			t.Fatalf("not one line: %q", b)
 		}

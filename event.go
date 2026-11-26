@@ -12,7 +12,9 @@ import (
 // Def defines an event: its name, level and where else it goes. An
 // application declares its events as package variables, so that the main
 // log, the security log and an event bus all take an event from one
-// definition. The record carries its Def, so two libraries may define
+// definition. A Def and its Sample are immutable while in use. Sample fields
+// must be nonnegative. Register and Emit panic on an invalid policy.
+// The record carries its Def, so two libraries may define
 // events without knowing of each other.
 type Def struct {
 	Name  string
@@ -26,7 +28,8 @@ type Def struct {
 	Bus bool
 	// Limit, when set, is the field whose value keys rate limiting: one
 	// line per event and value per minute, the next carrying how many were
-	// suppressed. "*" limits the event as a whole. Sample, when set, is
+	// suppressed. A grouped logger looks in its current group first,
+	// then at the root. "*" limits the event as a whole. Sample, when set, is
 	// used instead.
 	Limit  string
 	Sample *Sampling
@@ -55,11 +58,28 @@ func Register(defs ...*Def) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	for _, d := range defs {
-		if old, ok := registry[d.Name]; ok && old != d && !sameRouting(old, d) {
+		d.validate()
+		if old, ok := registry[d.Name]; ok && !sameRouting(old, d) {
 			panic("slogx: event " + d.Name + " defined twice")
 		}
-		registry[d.Name] = d
+		registry[d.Name] = new(d.clone())
 	}
+}
+
+func (d *Def) validate() {
+	if d.Sample != nil {
+		if err := d.Sample.validate(); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (d *Def) clone() Def {
+	c := *d
+	if d.Sample != nil {
+		c.Sample = new(*d.Sample)
+	}
+	return c
 }
 
 func sameRouting(a, b *Def) bool {
@@ -72,11 +92,7 @@ func Registered() []Def {
 	defer registryMu.RUnlock()
 	out := make([]Def, 0, len(registry))
 	for _, d := range registry {
-		c := *d
-		if d.Sample != nil {
-			c.Sample = new(*d.Sample)
-		}
-		out = append(out, c)
+		out = append(out, d.clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -113,8 +129,8 @@ func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFail
 // slog's args), carrying the attributes of ctx (Config.ContextAppend). The line's
 // message is d.Msg, or the value of the first argument with the key KeyMsg
 // ("msg", as a key-value pair or a slog.Attr), which is then not written as
-// an attribute. A security or bus event is passed on even when its level is
-// filtered out of the main log.
+// an attribute. A slogx handler routes security and bus events even below
+// the main log's threshold. Other handlers decide through Enabled.
 //
 //nolint:contextcheck // a nil ctx is accepted, as by slog, and means context.Background
 func Emit(ctx context.Context, l *slog.Logger, d *Def, args ...any) {
@@ -132,7 +148,10 @@ func callerPC(skip int) uintptr {
 
 func emit(ctx context.Context, l *slog.Logger, d *Def, pc uintptr, args []any) {
 	h := l.Handler()
-	if !d.Security && !d.Bus && !h.Enabled(ctx, d.Level) {
+	d.validate()
+	_, local := h.(*handler)
+	independent := local && (d.Security || d.Bus)
+	if !independent && !h.Enabled(ctx, d.Level) {
 		return
 	}
 	msg, before, after := splitMsg(d.Msg, args)
@@ -173,7 +192,20 @@ func splitMsg(msg string, args []any) (string, []any, []any) {
 // while Config.LogSecrets is on. Wrap secrets in it when they must travel
 // with other values. A Redacted message (the msg argument of Emit) is
 // always [REDACTED].
-type Redacted string
+func Redacted(value string) Secret { return Secret{raw: &value} }
+
+// Secret keeps a value masked in generic formatting, including private struct fields.
+type Secret struct{ raw *string }
 
 // LogValue implements slog.LogValuer.
-func (Redacted) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
+func (s Secret) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+// String masks secrets in composite values and formatted messages.
+// Custom marshalers and formatters must protect secrets they expose themselves.
+func (Secret) String() string { return "[REDACTED]" }
+
+// GoString masks Go-syntax representations.
+func (s Secret) GoString() string { return s.String() }
+
+// MarshalText masks text and JSON representations.
+func (s Secret) MarshalText() ([]byte, error) { return []byte(s.String()), nil }

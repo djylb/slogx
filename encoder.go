@@ -12,7 +12,7 @@ import (
 )
 
 // Encoder turns a record into bytes appended to dst, one line ending in a
-// newline. Every encoder writes the fixed fields first, in the order time,
+// newline. Text and JSON write the fixed fields first, in the order time,
 // level, event, module, then the record's attributes, then msg, source and
 // stack.
 type Encoder interface {
@@ -92,7 +92,7 @@ func (TextEncoder) Encode(b []byte, r *Record) []byte {
 		b = append(b, " module="...)
 		b = appendText(b, r.Module)
 	}
-	for _, a := range r.Attrs {
+	for a := range r.Attributes {
 		b = append(b, ' ')
 		b = appendKey(b, a.Key)
 		b = append(b, '=')
@@ -134,7 +134,7 @@ func (JSONEncoder) Encode(b []byte, r *Record) []byte {
 	}
 	str(KeyEvent, r.Event)
 	str(KeyModule, r.Module)
-	for _, a := range r.Attrs {
+	for a := range r.Attributes {
 		b = append(b, ',')
 		b = appendJSONString(b, a.Key)
 		b = append(b, ':')
@@ -180,7 +180,7 @@ func (e PrettyEncoder) Encode(b []byte, r *Record) []byte {
 		b = append(b, ' ')
 	}
 	b = append(b, sanitize(r.Msg)...)
-	for _, a := range r.Attrs {
+	for a := range r.Attributes {
 		b = append(b, ' ')
 		b = e.dim(b, a.Key+"=")
 		b = appendTextValue(b, a.Value)
@@ -190,8 +190,8 @@ func (e PrettyEncoder) Encode(b []byte, r *Record) []byte {
 		b = e.dim(b, r.Source)
 	}
 	if r.Stack != "" {
-		b = append(b, "\n\t"...)
-		b = append(b, sanitizeStack(r.Stack)...)
+		b = append(b, " stack="...)
+		b = append(b, sanitize(r.Stack)...)
 	}
 	return append(b, '\n')
 }
@@ -230,22 +230,6 @@ func sanitize(s string) string {
 		}
 	}
 	return s
-}
-
-func sanitizeStack(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := range len(s) {
-		c := s[i]
-		switch {
-		case c == '\n':
-			out = append(out, '\n', '\t')
-		case c < ' ' && c != '\t' || c == 0x7f:
-			out = append(out, '?')
-		default:
-			out = append(out, c)
-		}
-	}
-	return string(out)
 }
 
 func appendKey(b []byte, k string) []byte {
@@ -301,7 +285,7 @@ func valueString(v slog.Value) (s string) {
 // unsafeRune reports a character that terminals or bidi rendering act on
 // even though it is printable UTF-8: C1 controls and bidi overrides.
 func unsafeRune(r rune) bool {
-	return r >= 0x80 && r <= 0x9f || r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 || r == 0x200e || r == 0x200f
+	return r == 0x2028 || r == 0x2029 || r >= 0x80 && r <= 0x9f || r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 || r == 0x200e || r == 0x200f
 }
 
 func appendRuneEscape(b []byte, r rune) []byte {
@@ -402,7 +386,7 @@ func appendJSONString(b []byte, s string) []byte {
 			start = i
 			continue
 		}
-		if r == '\u2028' || r == '\u2029' || unsafeRune(r) {
+		if unsafeRune(r) {
 			b = append(b, s[start:i]...)
 			b = appendRuneEscape(b, r)
 			i += n
@@ -438,7 +422,14 @@ func appendJSONValue(b []byte, v slog.Value) []byte {
 			if j, err := marshalSafe(m); err == nil {
 				var c bytes.Buffer
 				if json.Compact(&c, j) == nil {
-					return append(b, c.Bytes()...)
+					for _, ch := range c.String() {
+						if unsafeRune(ch) || ch == 0x7f {
+							b = appendRuneEscape(b, ch)
+						} else {
+							b = utf8.AppendRune(b, ch)
+						}
+					}
+					return b
 				}
 			}
 		}

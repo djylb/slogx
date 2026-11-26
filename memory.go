@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ type Entry struct {
 	Module    string     `json:"module,omitempty"`
 	Event     string     `json:"event,omitempty"`
 	Msg       string     `json:"msg,omitempty"`
+	Source    string     `json:"source,omitempty"`
+	Stack     string     `json:"stack,omitempty"`
 	Attrs     []Field    `json:"attrs,omitempty"`
 }
 
@@ -29,15 +32,24 @@ type Field struct {
 	Value string `json:"value"`
 }
 
-// Record returns e as a record with string attributes, for an Encoder:
+// Record returns e as a record with string attributes and a numeric
+// sampling count, for an Encoder:
 // enc.Encode(dst, &r).
-func (e *Entry) Record() Record {
-	r := Record{Time: e.Time, Level: e.Level, Module: e.Module, Event: e.Event, Msg: e.Msg}
+func (e Entry) Record() Record {
+	r := Record{Time: e.Time, Level: e.Level, Module: e.Module, Event: e.Event, Msg: e.Msg, Source: e.Source, Stack: e.Stack}
 	for _, f := range e.Attrs {
+		if f.Key == KeySuppressed {
+			if n, err := strconv.ParseUint(f.Value, 10, 64); err == nil && n > 0 {
+				r.Suppressed = n
+				continue
+			}
+		}
 		r.Attrs = append(r.Attrs, slog.String(f.Key, f.Value))
 	}
 	return r
 }
+
+func (e Entry) clone() Entry { e.Attrs = slices.Clone(e.Attrs); return e }
 
 // Query selects entries. The zero Query selects everything.
 type Query struct {
@@ -54,7 +66,7 @@ func (q *Query) match(e *Entry) bool {
 	if e.Seq <= q.After || (!q.Since.IsZero() && e.Time.Before(q.Since)) {
 		return false
 	}
-	if q.MinLevel != nil && e.Level < q.MinLevel.Level() {
+	if q.MinLevel != nil && !levelAllows(q.MinLevel.Level(), e.Level) {
 		return false
 	}
 	if len(q.Modules) > 0 && !slices.Contains(q.Modules, e.Module) {
@@ -80,19 +92,21 @@ func (q *Query) match(e *Entry) bool {
 // Query reads them, Subscribe follows new ones, Take hands out each entry
 // once. Use it as the destination of a Route (Route.Memory). A nil *Memory,
 // such as Logs.Memory without Config.Memory, keeps nothing: its reads are
-// empty and its subscriptions closed.
+// empty and its subscriptions closed. Use NewMemory for a writable route.
 type Memory struct {
-	mu    sync.Mutex
-	buf   []Entry
-	next  int // where the next entry goes once buf is full
-	seq   uint64
-	taken uint64
-	subs  map[*Subscription]struct{}
+	mu      sync.Mutex
+	size    int
+	retired bool
+	buf     []Entry
+	next    int // where the next entry goes once buf is full
+	seq     uint64
+	taken   uint64
+	subs    map[*Subscription]struct{}
 }
 
 // NewMemory keeps up to size entries.
 func NewMemory(size int) *Memory {
-	return &Memory{buf: make([]Entry, 0, max(size, 1))}
+	return &Memory{size: max(size, 1), buf: make([]Entry, 0, max(size, 1))}
 }
 
 // Size is how many entries m keeps.
@@ -100,16 +114,20 @@ func (m *Memory) Size() int {
 	if m == nil {
 		return 0
 	}
-	return cap(m.buf)
+	return m.size
 }
 
 func (m *Memory) add(r *Record) {
-	e := Entry{Time: r.Time, Level: r.Level, LevelName: LevelName(r.Level), Module: r.Module, Event: r.Event, Msg: r.Msg}
-	if len(r.Attrs) > 0 {
-		e.Attrs = make([]Field, len(r.Attrs))
-		for i, a := range r.Attrs {
-			e.Attrs[i] = Field{Key: a.Key, Value: string(appendPlain(nil, a.Value))}
-		}
+	e := Entry{Time: r.Time, Level: r.Level, LevelName: LevelName(r.Level), Module: r.Module, Event: r.Event, Msg: r.Msg, Source: r.Source, Stack: r.Stack}
+	size := len(r.Attrs)
+	if r.Suppressed > 0 {
+		size++
+	}
+	if size > 0 {
+		e.Attrs = make([]Field, 0, size)
+	}
+	for a := range r.Attributes {
+		e.Attrs = append(e.Attrs, Field{Key: a.Key, Value: string(appendPlain(nil, a.Value))})
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -123,9 +141,9 @@ func (m *Memory) add(r *Record) {
 	}
 	for s := range m.subs {
 		if s.q.match(&e) {
-			select {
-			case s.c <- e:
-			default:
+			if len(s.c) < cap(s.c) {
+				s.c <- e.clone()
+			} else {
 				s.dropped++
 			}
 		}
@@ -157,15 +175,16 @@ func (m *Memory) Query(q Query) []Entry {
 func (m *Memory) query(q *Query) []Entry {
 	var out []Entry
 	n := len(m.buf)
-	for i := range n {
+	for i := n - 1; i >= 0; i-- {
 		e := &m.buf[(m.next+i)%n]
 		if q.match(e) {
-			out = append(out, *e)
+			out = append(out, e.clone())
+			if len(out) == q.Limit {
+				break
+			}
 		}
 	}
-	if q.Limit > 0 && len(out) > q.Limit {
-		out = out[len(out)-q.Limit:]
-	}
+	slices.Reverse(out)
 	return out
 }
 
@@ -211,14 +230,15 @@ func (s *Subscription) Close() {
 	s.m.mu.Lock()
 	s.end()
 	s.m.mu.Unlock()
-	if s.stop != nil {
-		s.stop()
-	}
 }
 
 // end removes s; m.mu is held.
 func (s *Subscription) end() {
 	if _, ok := s.m.subs[s]; ok {
+		if s.stop != nil {
+			s.stop()
+			s.stop = nil
+		}
 		delete(s.m.subs, s)
 		close(s.c)
 	}
@@ -230,19 +250,25 @@ func (s *Subscription) end() {
 // logging. The subscription ends when ctx is done, Close is called, or the
 // Memory is retired by Configure or Logs.Close.
 func (m *Memory) Subscribe(ctx context.Context, q Query, size int) *Subscription {
-	if m == nil {
+	if m.Size() == 0 {
 		c := make(chan Entry)
 		close(c)
 		return &Subscription{c: c}
 	}
 	q.After, q.Since, q.Limit = 0, time.Time{}, 0
+	q.Modules = slices.Clone(q.Modules)
+	q.Events = slices.Clone(q.Events)
 	s := &Subscription{m: m, q: q, c: make(chan Entry, max(size, 1))}
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retired || ctx.Err() != nil {
+		close(s.c)
+		return s
+	}
 	if m.subs == nil {
 		m.subs = map[*Subscription]struct{}{}
 	}
 	m.subs[s] = struct{}{}
-	m.mu.Unlock()
 	if ctx.Done() != nil {
 		s.stop = context.AfterFunc(ctx, s.Close)
 	}
@@ -252,17 +278,11 @@ func (m *Memory) Subscribe(ctx context.Context, q Query, size int) *Subscription
 // closeSubscriptions ends every subscription.
 func (m *Memory) closeSubscriptions() {
 	m.mu.Lock()
-	subs := make([]*Subscription, 0, len(m.subs))
+	m.retired = true
 	for s := range m.subs {
 		s.end()
-		subs = append(subs, s)
 	}
 	m.mu.Unlock()
-	for _, s := range subs {
-		if s.stop != nil {
-			s.stop()
-		}
-	}
 }
 
 // Text returns the kept entries q selects encoded with enc, for a plain

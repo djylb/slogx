@@ -4,6 +4,8 @@ package slogxtest
 import (
 	"io"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 
 	"github.com/djylb/slogx"
@@ -43,7 +45,7 @@ func New() (*slogx.Logs, *Recorder) {
 
 func (r *Recorder) add(rec *slogx.Record) {
 	ln := Line{Level: rec.Level, Module: rec.Module, Event: rec.Event, Msg: rec.Msg, Attrs: map[string]string{}}
-	for _, a := range rec.Attrs {
+	for a := range rec.Attributes {
 		ln.Attrs[a.Key] = a.Value.String()
 	}
 	r.mu.Lock()
@@ -55,7 +57,11 @@ func (r *Recorder) add(rec *slogx.Record) {
 func (r *Recorder) Lines() []Line {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]Line(nil), r.lines...)
+	lines := slices.Clone(r.lines)
+	for i := range lines {
+		lines[i].Attrs = maps.Clone(lines[i].Attrs)
+	}
+	return lines
 }
 
 // Events returns the recorded lines of event name.
@@ -82,14 +88,14 @@ type TB interface {
 	Cleanup(f func())
 }
 
-// ToTest returns Logs that write every line, logfmt, to the output of t,
-// where go test shows it with the test's own log; it closes when t ends.
+// ToTest writes logfmt to the test output at trace and above. Its bounded
+// queue counts overflow in Logs.Dropped and drains during test cleanup.
 func ToTest(t TB) *slogx.Logs {
 	l := slogx.New()
 	route := slogx.Route{Name: "test", Match: slogx.MatchMinLevel(slogx.LevelTrace), Below: true, Output: slogx.WriterOutput(t.Output())}
 	if err := l.Configure(slogx.Config{Console: slogx.ConsoleOff, Level: "off", Routes: []slogx.Route{route}}); err != nil {
 		panic(err)
 	}
-	t.Cleanup(l.Close)
+	t.Cleanup(func() { _ = l.Close() })
 	return l
 }

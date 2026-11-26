@@ -3,13 +3,16 @@ package slogx
 import (
 	"compress/gzip"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,7 +44,7 @@ type Rotation struct {
 	// Compress gzips rotated files.
 	Compress bool
 	// Mode is the permission of new log files; zero is 0640, readable by
-	// the owner's group (such as an admin group running fail2ban) and no
+	// the owner's group (such as log monitoring services) and no
 	// one else. Directories made for them get the same bits plus search.
 	Mode os.FileMode
 }
@@ -58,55 +61,193 @@ func dirMode(m os.FileMode) os.FileMode { return m | (m&0o444)>>2 }
 const defaultMaxSize = 64 << 20
 
 // rotatedLayout is the time in a rotated file's name, UTC:
-// <name>-20261108T031245.000[-N]<ext>[.gz].
+// .slogx-archives/<full filename>/20261108T031245.000[-N][.gz].
 const rotatedLayout = "20060102T150405.000"
+const archiveRoot = ".slogx-archives"
 
 // Rotating is an Output to a file that rotates itself: the full file is
-// renamed to <name>-<UTC time><ext> and a new one started. Compression and
-// pruning of rotated files run in order on one goroutine of its own, so they
-// never race each other or the writer.
+// moved into .slogx-archives/<full filename> under its UTC timestamp.
+// A new active file is then opened. A background worker compresses and
+// prunes archives while the writer continues to append and rotate.
 type Rotating struct {
-	f       *os.File
-	work    chan struct{} // a rotation happened: compress and prune
-	timer   *time.Timer   // writes buf out FlushInterval after its first line
-	buf     []byte        // lines not yet written, with BufferSize
-	late    error         // a timed flush failed; the next call returns it
-	dir     string
-	base    string // file name without ext
-	ext     string
-	cfg     Rotation
-	opened  time.Time
-	size    int64
-	workers sync.WaitGroup
-	mu      sync.Mutex
-	closed  bool
+	file   atomic.Pointer[rotatingFile] // read by matchers to identify shared destinations
+	path   string                       // absolute configured path, including symlinks, for Reopen
+	lease  sync.RWMutex
+	result error
+}
+
+var activeFiles = struct {
+	sync.Mutex
+	files map[string]*rotatingFile
+}{files: make(map[string]*rotatingFile)}
+var errRotationConflict = errors.New("slogx: conflicting rotation for active file")
+
+type rotatingFile struct {
+	archiveMu   sync.Mutex // pairs archive name selection with plain-to-gzip publication
+	start       sync.Once
+	done        chan struct{} // closed after the last handle finishes maintenance
+	refs        int           // guarded by activeFiles
+	deadline    time.Time
+	maintenance error
+	f           *os.File
+	identity    atomic.Pointer[os.FileInfo] // identity of the opened file, even after an external rename
+	work        chan struct{}               // a rotation happened: compress and prune
+	timer       *time.Timer                 // writes buf out FlushInterval after its first line
+	buf         []byte                      // lines not yet written, with BufferSize
+	late        error                       // a timed flush failed; the next call returns it
+	dir         string
+	cfg         Rotation
+	opened      time.Time
+	size        int64
+	workers     sync.WaitGroup
+	mu          sync.Mutex
+	closed      bool
 }
 
 const defaultFlushInterval = time.Second
 
-// OpenRotating opens the file of c, creating its directory.
+// OpenRotating opens the file of c, creating its directory. Compatible opens
+// share rotation and maintenance. Close each returned handle. A conflicting
+// rotation policy or hard-link alias of an active file returns an error.
 func OpenRotating(c Rotation) (*Rotating, error) {
+	r, err := reserveRotating(c)
+	if err == nil {
+		r.file.Load().activate(compressFile)
+	}
+	return r, err
+}
+
+// A compressor prepares a complete temporary file beside the plain archive.
+type compressor func(string, os.FileMode) (string, error)
+
+func (r *rotatingFile) activate(compress compressor) {
+	r.start.Do(func() {
+		r.workers.Go(func() { r.maintain(compress) })
+		r.work <- struct{}{}
+	})
+}
+
+func reserveRotating(c Rotation) (*Rotating, error) {
+	c.Mode = c.mode()
+	c.BufferSize = max(c.BufferSize, 0)
+	switch {
+	case c.BufferSize == 0:
+		c.FlushInterval = 0
+	case c.FlushInterval == 0:
+		c.FlushInterval = defaultFlushInterval
+	case c.FlushInterval < 0:
+		c.FlushInterval = -1
+	}
+	c.MaxAge = max(c.MaxAge, 0)
+	c.MaxFiles = max(c.MaxFiles, 0)
+	c.Every = max(c.Every, 0)
+	c.MaxSize = max(c.MaxSize, -1)
 	if c.MaxSize == 0 {
 		c.MaxSize = defaultMaxSize
 	}
-	if err := os.MkdirAll(filepath.Dir(c.Path), dirMode(c.mode())); err != nil {
+	path, err := filepath.Abs(c.Path)
+	if err != nil {
 		return nil, err
 	}
-	name := filepath.Base(c.Path)
-	ext := filepath.Ext(name)
-	r := &Rotating{cfg: c, dir: filepath.Dir(c.Path), base: strings.TrimSuffix(name, ext), ext: ext, work: make(chan struct{}, 1)}
+	f, err := reserveFile(c, path)
+	if err != nil {
+		return nil, err
+	}
+	h := &Rotating{path: path}
+	h.file.Store(f)
+	return h, nil
+}
+
+// reserveFile takes a reference using an already normalized rotation policy.
+func reserveFile(c Rotation, path string) (*rotatingFile, error) {
+	activeFiles.Lock()
+	defer activeFiles.Unlock()
+	var err error
+retry:
+	c.Path, err = rotationTarget(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	for part := range strings.SplitSeq(filepath.ToSlash(c.Path), "/") {
+		if strings.EqualFold(part, archiveRoot) {
+			return nil, fmt.Errorf("%w: reserved archive directory in %s", errRotationConflict, path)
+		}
+	}
+	info, _ := os.Stat(c.Path)
+	var current *rotatingFile
+	for name, r := range activeFiles.files {
+		same := name == c.Path || (runtime.GOOS == "windows" && strings.EqualFold(name, c.Path))
+		if same {
+			current = r
+		} else if info != nil && os.SameFile(info, *r.identity.Load()) {
+			return nil, fmt.Errorf("%w: %s", errRotationConflict, path)
+		}
+	}
+	if current != nil {
+		c.Path = current.cfg.Path
+		if current.refs == 0 {
+			activeFiles.Unlock()
+			<-current.done
+			activeFiles.Lock()
+			goto retry
+		}
+		if c != current.cfg {
+			return nil, fmt.Errorf("%w: %s", errRotationConflict, path)
+		}
+		current.refs++
+		return current, nil
+	}
+	r := &rotatingFile{refs: 1, done: make(chan struct{}), cfg: c, dir: filepath.Join(filepath.Dir(c.Path), archiveRoot, filepath.Base(c.Path)), work: make(chan struct{}, 1)}
+	if err = os.MkdirAll(filepath.Dir(c.Path), dirMode(c.Mode)); err != nil {
+		return nil, err
+	}
 	if err := r.open(); err != nil {
 		return nil, err
 	}
 	if c.BufferSize > 0 {
 		r.buf = make([]byte, 0, c.BufferSize)
 	}
-	r.workers.Go(r.maintain)
+	activeFiles.files[c.Path] = r
 	return r, nil
 }
 
-func (r *Rotating) open() error {
-	f, err := os.OpenFile(r.cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, r.cfg.mode())
+func rotationTarget(path string, links map[string]bool) (string, error) {
+	target, err := filepath.EvalSymlinks(path)
+	if !errors.Is(err, os.ErrNotExist) || filepath.Dir(path) == path {
+		return target, err
+	}
+	// Resolve the existing ancestors before creating any missing components.
+	parent, err := rotationTarget(filepath.Dir(path), links)
+	if err != nil {
+		return "", err
+	}
+	target = filepath.Join(parent, filepath.Base(path))
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && info.Mode()&os.ModeSymlink == 0) {
+		return target, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if links[target] {
+		return "", fmt.Errorf("cyclic rotation path %s", target)
+	}
+	if links == nil {
+		links = make(map[string]bool)
+	}
+	links[target] = true
+	link, err := os.Readlink(target)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(link) {
+		link = filepath.Join(parent, link)
+	}
+	return rotationTarget(link, links)
+}
+
+func (r *rotatingFile) open() error {
+	f, err := os.OpenFile(r.cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, r.cfg.Mode)
 	if err != nil {
 		return err
 	}
@@ -116,6 +257,7 @@ func (r *Rotating) open() error {
 		return err
 	}
 	r.f, r.size, r.opened = f, fi.Size(), time.Now()
+	r.identity.Store(&fi)
 	return nil
 }
 
@@ -125,19 +267,29 @@ func (r *Rotating) open() error {
 // including by the FlushInterval timer, is returned by the next Write,
 // Flush or Close.
 func (r *Rotating) Write(p []byte) error {
+	r.lease.RLock()
+	defer r.lease.RUnlock()
+	f := r.file.Load()
+	if f == nil {
+		return os.ErrClosed
+	}
+	return f.Write(p)
+}
+
+func (r *rotatingFile) Write(p []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return errors.Join(r.takeLate(), r.write(p))
 }
 
 // takeLate returns and clears the error of a timed flush; r.mu is held.
-func (r *Rotating) takeLate() error {
-	err := r.late
-	r.late = nil
+func (r *rotatingFile) takeLate() error {
+	err := errors.Join(r.late, r.maintenance)
+	r.late, r.maintenance = nil, nil
 	return err
 }
 
-func (r *Rotating) write(p []byte) error {
+func (r *rotatingFile) write(p []byte) error {
 	if r.closed {
 		return os.ErrClosed
 	}
@@ -146,70 +298,70 @@ func (r *Rotating) write(p []byte) error {
 			return err
 		}
 	}
-	var err error
-	bySize := r.cfg.MaxSize > 0 && r.size > 0 && r.size+int64(len(p)) > r.cfg.MaxSize
-	byTime := r.cfg.Every > 0 && r.size > 0 && time.Since(r.opened) >= r.cfg.Every
+	size := r.size + int64(len(r.buf))
+	bySize := r.cfg.MaxSize > 0 && size > 0 && size+int64(len(p)) > r.cfg.MaxSize
+	byTime := r.cfg.Every > 0 && size > 0 && time.Since(r.opened) >= r.cfg.Every
+	var rotationErr error
 	if bySize || byTime {
-		// lines buffered for the old file go to it, not the new one
-		err = r.writeBuffered()
-		r.rotate()
+		if err := r.writeBuffered(); err != nil {
+			return err
+		}
+		rotationErr = r.rotate()
 		if r.f == nil {
-			if oerr := r.open(); oerr != nil {
-				return errors.Join(err, oerr)
-			}
+			return rotationErr
 		}
 	}
-	if r.cfg.BufferSize <= 0 {
-		n, werr := r.f.Write(p)
-		r.size += int64(n)
-		return errors.Join(err, werr)
-	}
+	return errors.Join(rotationErr, r.appendLine(p))
+}
+
+func (r *rotatingFile) appendLine(p []byte) error {
 	if len(r.buf)+len(p) > cap(r.buf) {
-		err = errors.Join(err, r.writeBuffered())
+		if err := r.writeBuffered(); err != nil {
+			return err
+		}
 	}
 	if len(p) >= cap(r.buf) {
-		n, werr := r.f.Write(p)
-		r.size += int64(n)
-		return errors.Join(err, werr)
+		_, err := r.direct(p)
+		return err
 	}
-	if len(r.buf) == 0 {
+	if r.deadline.IsZero() {
 		r.armTimer()
 	}
 	r.buf = append(r.buf, p...)
-	r.size += int64(len(p))
-	return err
+	return nil
 }
 
-// writeBuffered writes the buffered lines to the file; r.mu is held. The
-// buffer is emptied even when the write fails, so a broken file cannot
-// grow it without bound.
-func (r *Rotating) writeBuffered() error {
+func (r *rotatingFile) direct(p []byte) (int, error) {
+	if r.f == nil {
+		return 0, os.ErrClosed
+	}
+	n, err := r.f.Write(p)
+	r.size += int64(n)
+	return n, err
+}
+
+// writeBuffered retains the unwritten suffix for the next flush.
+func (r *rotatingFile) writeBuffered() error {
 	if len(r.buf) == 0 {
 		return nil
 	}
 	if r.timer != nil {
 		r.timer.Stop()
 	}
-	var err error
-	if r.f != nil {
-		_, err = r.f.Write(r.buf)
-	} else {
-		err = os.ErrClosed
-	}
-	r.buf = r.buf[:0]
+	r.deadline = time.Time{}
+	n, err := r.direct(r.buf)
+	r.buf = r.buf[:copy(r.buf, r.buf[n:])]
 	return err
 }
 
 // armTimer schedules writing out the buffer that a line is about to start;
 // r.mu is held.
-func (r *Rotating) armTimer() {
+func (r *rotatingFile) armTimer() {
 	d := r.cfg.FlushInterval
 	if d < 0 {
 		return
 	}
-	if d == 0 {
-		d = defaultFlushInterval
-	}
+	r.deadline = time.Now().Add(d)
 	if r.timer == nil {
 		r.timer = time.AfterFunc(d, r.flushOnTime)
 		return
@@ -219,18 +371,32 @@ func (r *Rotating) armTimer() {
 
 // flushOnTime writes out the buffer when FlushInterval has passed. Its
 // error has no caller, so it is kept for the next Write, Flush or Close.
-func (r *Rotating) flushOnTime() {
+func (r *rotatingFile) flushOnTime() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.closed {
+	if !r.closed && !time.Now().Before(r.deadline) {
 		r.late = errors.Join(r.late, r.writeBuffered())
 	}
 }
 
 // rotate renames the current file to a name no other rotated file has and
 // starts a new one; r.mu is held and the buffer written out.
-func (r *Rotating) rotate() {
-	_ = r.f.Close()
+func (r *rotatingFile) rotate() error {
+	r.archiveMu.Lock()
+	defer r.archiveMu.Unlock()
+	// External rotation may have moved the open file. Keep writing to the
+	// open descriptor until Reopen; the replacement belongs to its creator.
+	current, err := os.Lstat(r.cfg.Path)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && !os.SameFile(*r.identity.Load(), current)) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err = r.archiveDirectory(true); err != nil {
+		return err
+	}
+	err = r.f.Close()
 	r.f = nil
 	stamp := time.Now().UTC().Format(rotatedLayout)
 	var name string
@@ -239,58 +405,116 @@ func (r *Rotating) rotate() {
 		if i > 0 {
 			suffix = "-" + strconv.Itoa(i)
 		}
-		name = filepath.Join(r.dir, r.base+"-"+stamp+suffix+r.ext)
-		if !exists(name) && !exists(name+".gz") {
+		name = filepath.Join(r.dir, stamp+suffix)
+		available, probeErr := archiveNameAvailable(name)
+		if probeErr != nil {
+			return errors.Join(err, fmt.Errorf("probe archive: %w", probeErr), r.open())
+		}
+		if available {
 			break
 		}
 	}
-	if os.Rename(r.cfg.Path, name) == nil {
+	if err == nil {
+		if e := os.Rename(r.cfg.Path, name); e != nil {
+			err = fmt.Errorf("publish archive: %w", e)
+		}
+	}
+	if err == nil {
 		select {
 		case r.work <- struct{}{}:
 		default: // a pass is already due; it sees this file too
 		}
 	}
-	_ = r.open()
+	return errors.Join(err, r.open())
 }
 
-func exists(name string) bool {
-	_, err := os.Lstat(name)
-	return err == nil
+func archiveNameAvailable(name string) (bool, error) {
+	for _, candidate := range []string{name, name + ".gz"} {
+		_, err := os.Lstat(candidate)
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // maintain prunes and then compresses the rotated files after each
 // rotation. Each pass looks at every rotated file, so rotations that come
 // faster than a pass are never left behind.
-func (r *Rotating) maintain() {
+func (r *rotatingFile) maintain(compress compressor) {
 	for range r.work {
-		r.prune()
-		if r.cfg.Compress {
-			for _, f := range r.rotatedFiles() {
-				if !strings.HasSuffix(f.path, ".gz") {
-					compressFile(f.path, r.cfg.mode())
-				}
+		files, err := r.scan()
+		if err == nil {
+			err = r.maintainFiles(files, compress)
+		}
+		if err != nil {
+			r.mu.Lock()
+			if r.maintenance == nil {
+				r.maintenance = err
 			}
+			r.mu.Unlock()
 		}
 	}
 }
 
-// Reopen closes and reopens the file, after an external rotation.
+// Reopen flushes the file and follows the configured path again. If a
+// symlink now points elsewhere, only this handle moves to the new target.
 func (r *Rotating) Reopen() error {
+	r.lease.Lock()
+	defer r.lease.Unlock()
+	old := r.file.Load()
+	if old == nil {
+		return os.ErrClosed
+	}
+	target, err := reserveFile(old.cfg, r.path)
+	if err != nil {
+		return err
+	}
+	if target == old {
+		return errors.Join(target.release(), old.Reopen())
+	}
+	if err = old.Flush(); err != nil {
+		return errors.Join(err, target.release())
+	}
+	target.activate(compressFile)
+	r.file.Store(target)
+	return old.release()
+}
+
+func (r *rotatingFile) Reopen() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return os.ErrClosed
 	}
-	err := r.writeBuffered()
-	if r.f != nil {
-		_ = r.f.Close()
+	if err := r.writeBuffered(); err != nil {
+		return err
 	}
-	r.f = nil
-	return errors.Join(err, r.open())
+	previous := r.f
+	if err := r.open(); err != nil {
+		return err
+	}
+	if previous != nil {
+		return previous.Close()
+	}
+	return nil
 }
 
 // Flush writes out the buffer and syncs the file to disk.
 func (r *Rotating) Flush() error {
+	r.lease.RLock()
+	defer r.lease.RUnlock()
+	f := r.file.Load()
+	if f == nil {
+		return os.ErrClosed
+	}
+	return f.Flush()
+}
+
+func (r *rotatingFile) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	err := errors.Join(r.takeLate(), r.writeBuffered())
@@ -303,6 +527,31 @@ func (r *Rotating) Flush() error {
 // Close closes the file and waits for compression and pruning; writes
 // after it fail.
 func (r *Rotating) Close() error {
+	r.lease.Lock()
+	defer r.lease.Unlock()
+	if f := r.file.Swap(nil); f != nil {
+		r.result = errors.Join(f.Flush(), f.release())
+	}
+	return r.result
+}
+
+func (r *rotatingFile) release() error {
+	activeFiles.Lock()
+	r.refs--
+	last := r.refs == 0
+	activeFiles.Unlock()
+	if !last {
+		return nil
+	}
+	err := r.Close()
+	activeFiles.Lock()
+	delete(activeFiles.files, r.cfg.Path)
+	close(r.done)
+	activeFiles.Unlock()
+	return err
+}
+
+func (r *rotatingFile) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -320,41 +569,47 @@ func (r *Rotating) Close() error {
 	close(r.work)
 	r.mu.Unlock()
 	r.workers.Wait()
-	return err
+	return errors.Join(err, r.maintenance)
 }
 
 // rotated is a file that Rotating made, with the time in its name.
 type rotated struct {
-	path string
-	at   time.Time
-	seq  int
+	path       string
+	at         time.Time
+	temporary  bool
+	compressed bool
+	seq        int
 }
 
-// rotatedFiles lists the files of the directory whose names are exactly
-// what rotate produces for this file, newest first. Other files, such as a
-// sibling log whose name starts the same, are never listed.
-func (r *Rotating) rotatedFiles() []rotated {
+func (r *rotatingFile) scan() ([]rotated, error) {
+	if err := r.archiveDirectory(false); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
 	entries, err := os.ReadDir(r.dir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []rotated
-	prefix := r.base + "-"
 	for _, e := range entries {
 		n := e.Name()
-		if e.IsDir() || !strings.HasPrefix(n, prefix) {
+		if !e.Type().IsRegular() {
 			continue
 		}
-		rest := strings.TrimSuffix(n[len(prefix):], ".gz")
-		if !strings.HasSuffix(rest, r.ext) {
-			continue
+		rest := n
+		archive, suffix, hasTemp := strings.Cut(rest, ".gz.tmp")
+		temporary := hasTemp && (suffix == "" || validTempSuffix(suffix))
+		if temporary {
+			rest = archive
 		}
-		rest = rest[:len(rest)-len(r.ext)]
+		rest, compressed := strings.CutSuffix(rest, ".gz")
 		if len(rest) < len(rotatedLayout) {
 			continue
 		}
 		at, err := time.Parse(rotatedLayout, rest[:len(rotatedLayout)])
-		if err != nil {
+		if err != nil || at.Format(rotatedLayout) != rest[:len(rotatedLayout)] {
 			continue
 		}
 		seq := 0
@@ -362,11 +617,11 @@ func (r *Rotating) rotatedFiles() []rotated {
 			if tail[0] != '-' {
 				continue
 			}
-			if seq, err = strconv.Atoi(tail[1:]); err != nil || seq < 1 {
+			if seq, err = strconv.Atoi(tail[1:]); err != nil || seq < 1 || strconv.Itoa(seq) != tail[1:] {
 				continue
 			}
 		}
-		out = append(out, rotated{path: filepath.Join(r.dir, n), at: at, seq: seq})
+		out = append(out, rotated{path: filepath.Join(r.dir, n), at: at, seq: seq, compressed: compressed, temporary: temporary})
 	}
 	slices.SortFunc(out, func(a, b rotated) int {
 		if c := b.at.Compare(a.at); c != 0 {
@@ -374,47 +629,92 @@ func (r *Rotating) rotatedFiles() []rotated {
 		}
 		return b.seq - a.seq
 	})
-	return out
+	return out, nil
 }
 
-// prune removes rotated files beyond MaxFiles or older than MaxAge. A file
-// and its compressed copy (while compression runs) count once.
-func (r *Rotating) prune() {
-	if r.cfg.MaxFiles <= 0 && r.cfg.MaxAge <= 0 {
-		return
+// Each target owns a directory. A link in either component could make
+// retention for one target delete another target's files.
+func (r *rotatingFile) archiveDirectory(create bool) error {
+	for _, dir := range []string{filepath.Dir(r.dir), r.dir} {
+		if create {
+			if err := os.Mkdir(dir, dirMode(r.cfg.Mode)); err != nil && !errors.Is(err, os.ErrExist) {
+				return err
+			}
+		}
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("invalid archive directory %s", dir)
+		}
 	}
+	return nil
+}
+
+// maintainFiles counts compressed and plain forms as one archive.
+func (r *rotatingFile) maintainFiles(files []rotated, compress compressor) error {
+	var errs error
 	kept := 0
-	seen := map[string]bool{}
-	for _, f := range r.rotatedFiles() {
-		key := strings.TrimSuffix(f.path, ".gz")
-		if seen[key] {
+	previous := ""
+	for _, f := range files {
+		if f.temporary {
+			errs = errors.Join(errs, os.Remove(f.path))
 			continue
 		}
-		seen[key] = true
-		drop := r.cfg.MaxFiles > 0 && kept >= r.cfg.MaxFiles
-		if !drop && r.cfg.MaxAge > 0 && time.Since(f.at) > r.cfg.MaxAge {
-			drop = true
+		key := f.path
+		if f.compressed {
+			key = strings.TrimSuffix(key, ".gz")
 		}
-		if drop {
-			_ = os.Remove(key)
-			_ = os.Remove(key + ".gz")
+		if previous != key {
+			kept++
+			previous = key
+		}
+		if r.cfg.MaxFiles > 0 && kept > r.cfg.MaxFiles || r.cfg.MaxAge > 0 && time.Since(f.at) > r.cfg.MaxAge {
+			errs = errors.Join(errs, os.Remove(f.path))
 			continue
 		}
-		kept++
+		if r.cfg.Compress && !f.compressed {
+			tmp, err := compress(f.path, r.cfg.Mode)
+			if err == nil {
+				// The plain name stays occupied throughout compression. Move
+				// from plain to gzip atomically with respect to name probes.
+				r.archiveMu.Lock()
+				err = os.Rename(tmp, f.path+".gz")
+				if err == nil {
+					err = os.Remove(f.path)
+				} else {
+					err = errors.Join(err, os.Remove(tmp))
+				}
+				r.archiveMu.Unlock()
+			}
+			if err != nil {
+				errs = errors.Join(errs, fmt.Errorf("compress archive %s: %w", f.path, err))
+			}
+		}
 	}
+	return errs
 }
 
-// compressFile writes name.gz through a temporary file, then removes name.
-func compressFile(name string, mode os.FileMode) {
+// compressFile returns the completed temporary gzip for publication.
+func compressFile(name string, mode os.FileMode) (string, error) {
 	in, err := os.Open(name) //nolint:gosec // name is a rotated file of this package, not input
 	if err != nil {
-		return
+		return "", err
 	}
 	defer func() { _ = in.Close() }()
-	tmp := name + ".gz.tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, mode) //nolint:gosec // tmp derives from the rotated file name above
+	out, err := os.CreateTemp(filepath.Dir(name), filepath.Base(name)+".gz.tmp-*")
 	if err != nil {
-		return
+		return "", err
+	}
+	tmp := out.Name()
+	// CreateTemp starts private. Apply only permission bits permitted on the source archive.
+	fi, err := in.Stat()
+	if err == nil {
+		err = out.Chmod(mode & fi.Mode().Perm())
+	}
+	if err != nil {
+		return "", errors.Join(err, out.Close(), os.Remove(tmp))
 	}
 	zw := gzip.NewWriter(out)
 	_, err = io.Copy(zw, in)
@@ -424,13 +724,22 @@ func compressFile(name string, mode os.FileMode) {
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
-	if err == nil {
-		err = os.Rename(tmp, name+".gz")
-	}
 	if err != nil {
-		_ = os.Remove(tmp)
-		return
+		return "", errors.Join(err, os.Remove(tmp))
 	}
-	_ = in.Close()
-	_ = os.Remove(name)
+	return tmp, nil
+}
+
+// CreateTemp replaces its trailing star with decimal digits.
+func validTempSuffix(s string) bool {
+	digits, ok := strings.CutPrefix(s, "-")
+	if !ok || digits == "" {
+		return false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

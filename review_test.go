@@ -9,42 +9,40 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 )
 
 func TestConfigureWhileLogging(t *testing.T) {
-	dir := t.TempDir()
-	l := New()
-	defer l.Close()
-	cfg := Config{Console: ConsoleOff, File: Rotation{Path: filepath.Join(dir, "a.log")}, Async: 64}
-	if err := l.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	for range 4 {
-		wg.Go(func() {
-			m := l.Module("x")
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					m.Info("line", "k", 1)
-				}
-			}
-		})
-	}
-	for range 20 {
-		if err := l.Configure(cfg); err != nil {
-			t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		l := New()
+		path := filepath.Join(t.TempDir(), "shared.log")
+		entered, release := make(chan struct{}), make(chan struct{})
+		cfg := Config{Console: ConsoleOff, File: Rotation{Path: path}, ContextAppend: func(_ context.Context, attrs []slog.Attr) []slog.Attr { close(entered); <-release; return attrs }}
+		check(t, l.Configure(cfg))
+		m := l.Module("m")
+		oldDone := make(chan struct{})
+		go func() { m.Info("old"); close(oldDone) }()
+		<-entered
+		cfg.ContextAppend = nil
+		configured := make(chan error, 1)
+		go func() { configured <- l.Configure(cfg) }()
+		synctest.Wait()
+		m.Info("new")
+		synctest.Wait() // the new queue drains while the old handler is held
+		if !strings.Contains(readFile(t, path), "msg=new") {
+			t.Fatal("successor did not write")
 		}
-	}
-	close(stop)
-	wg.Wait()
+		close(release)
+		<-oldDone
+		check(t, <-configured)
+		check(t, l.Close())
+		lines := strings.Split(strings.TrimSpace(readFile(t, path)), "\n")
+		if len(lines) != 2 || !strings.Contains(lines[0], "msg=new") || !strings.Contains(lines[1], "msg=old") {
+			t.Fatal(lines)
+		}
+	})
 }
 
 func TestRotatingWriteAfterClose(t *testing.T) {
@@ -56,14 +54,14 @@ func TestRotatingWriteAfterClose(t *testing.T) {
 	if !errors.Is(r.Write([]byte("x\n")), os.ErrClosed) {
 		t.Fatal("write after close did not fail")
 	}
-	if r.f != nil {
+	if r.file.Load() != nil {
 		t.Fatal("write after close reopened the file")
 	}
 }
 
 func TestPruneLeavesOtherFiles(t *testing.T) {
 	dir := t.TempDir()
-	keep := []string{"app-access.log", "app-old.log", "app-20261108T000000.000.txt", "app-.log", "other.log"}
+	keep := []string{"app-access.log", "app-old.log", "app-20261108T000000.000-+1.log", "app-20261108T000000.000-01.log", "app-20261108T000000.000.txt", "app-.log", "other.log"}
 	for _, n := range keep {
 		_ = os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644)
 	}
@@ -88,11 +86,12 @@ func TestRotationNamesAreUnique(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	file := r.file.Load()
 	for i := range 20 {
 		_ = r.Write([]byte{byte('a' + i), 'b', 'c', '\n'})
 	}
 	_ = r.Close()
-	files := r.rotatedFiles()
+	files := file.rotatedFiles()
 	if len(files) != 19 {
 		t.Fatalf("%d rotated files, want 19 (none overwritten)", len(files))
 	}
@@ -105,11 +104,12 @@ func TestRotateEvery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		file := r.file.Load()
 		_ = r.Write([]byte("one\n"))
 		time.Sleep(time.Hour)
 		_ = r.Write([]byte("two\n"))
 		_ = r.Close()
-		if n := len(r.rotatedFiles()); n != 1 {
+		if n := len(file.rotatedFiles()); n != 1 {
 			t.Fatalf("%d rotated files", n)
 		}
 	})
@@ -121,11 +121,12 @@ func TestCompressAndPruneInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	file := r.file.Load()
 	for range 30 {
 		_ = r.Write([]byte("01234567\n"))
 	}
 	_ = r.Close()
-	files := r.rotatedFiles()
+	files := file.rotatedFiles()
 	if len(files) != 3 {
 		t.Fatalf("%d rotated files kept", len(files))
 	}
@@ -134,7 +135,7 @@ func TestCompressAndPruneInOrder(t *testing.T) {
 			t.Fatalf("uncompressed %s", f.path)
 		}
 	}
-	if m, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(m) > 0 {
+	if m, _ := filepath.Glob(filepath.Join(file.dir, "*.tmp*")); len(m) > 0 {
 		t.Fatalf("temporary files left: %v", m)
 	}
 }
@@ -248,6 +249,14 @@ func TestPanickingValueDoesNotCrash(t *testing.T) {
 
 func TestAttributesCannotForgeFixedFields(t *testing.T) {
 	l, o := withRoute(t, Config{}, JSONEncoder{})
+	_, err := l.Attach(Route{Func: func(r *Record) {
+		edited := *r
+		edited.Attrs = []slog.Attr{slog.String(KeyMsg, "copied")}
+		if v, ok := edited.Attr("_msg"); !ok || v.String() != "copied" {
+			t.Error("copy with replaced attributes skipped reserved-key escaping")
+		}
+	}})
+	check(t, err)
 	l.Module("x").Info("real", "level", "DEBUG", "msg", "forged", "time", "0", "module", "admin", "event", "login_ok")
 	got := o.all()
 	for _, k := range []string{`"level":"DEBUG"`, `"msg":"forged"`, `"module":"admin"`, `"event":"login_ok"`} {
@@ -262,7 +271,7 @@ func TestAttributesCannotForgeFixedFields(t *testing.T) {
 
 func TestMemorySurvivesConfigure(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_ = l.Configure(Config{Console: ConsoleOff, Memory: 10})
 	m := l.Memory()
 	sub := m.Subscribe(context.Background(), Query{}, 4)

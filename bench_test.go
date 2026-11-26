@@ -17,7 +17,7 @@ func benchLogs(b *testing.B, enc Encoder) *Logs {
 	if err := l.Configure(Config{Console: ConsoleOff, Level: "info", Routes: []Route{{Encoder: enc, Output: discard{}}}}); err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(l.Close)
+	b.Cleanup(func() { _ = l.Close() })
 	return l
 }
 
@@ -76,11 +76,15 @@ func TestEnabledLineDoesNotAllocate(t *testing.T) {
 		t.Skip("the race detector allocates")
 	}
 	l := New()
-	if err := l.Configure(Config{Console: ConsoleOff, Routes: []Route{{Output: discard{}}}}); err != nil {
+	if err := l.Configure(Config{Console: ConsoleOff, Async: 4096, Routes: []Route{{Output: discard{}}}}); err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	m := l.Module("x")
+	defer func() { _ = l.Close() }()
+	m := l.Module("x").With(KeyModule, "alias").WithGroup("outer").With(slog.Group("inner", "tag", "fixed"))
+	if n := testing.AllocsPerRun(1000, func() { m.Info("grouped") }); n != 0 {
+		t.Fatalf("%v allocations for bound group", n)
+	}
+	m = l.Module("x")
 	if n := testing.AllocsPerRun(1000, func() { m.Info("done", "client", 42, "route", "tcp:8080", "ok", true) }); n != 0 {
 		t.Fatalf("%v allocations per line", n)
 	}
@@ -89,5 +93,8 @@ func TestEnabledLineDoesNotAllocate(t *testing.T) {
 	}
 	if n := testing.AllocsPerRun(1000, func() { Emit(context.Background(), m, &benchDef, "src_ip", "192.0.2.1", KeyMsg, "why") }); n != 0 {
 		t.Fatalf("%v allocations per event with a message", n)
+	}
+	if n := l.Dropped(); n != 0 {
+		t.Fatalf("allocation test dropped %d lines", n)
 	}
 }

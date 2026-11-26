@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -16,17 +17,19 @@ import (
 // LevelTrace is below debug, for per-packet detail.
 const LevelTrace = slog.Level(-8)
 
-// LevelOff is above every level: nothing is written.
+// LevelOff used as a minimum matches no records, including custom levels
+// numerically above it. Any enabled threshold is more verbose.
 const LevelOff = slog.Level(1 << 20)
 
 // Levels is the level table of a Logs: a default and per-module levels,
 // plus temporary overrides that expire. It is safe for concurrent use; reading
 // a level costs one atomic load.
 type Levels struct {
-	cur atomic.Pointer[levelTable]
-	mu  sync.Mutex // writers
+	cur  atomic.Pointer[LevelView]
+	view *atomic.Pointer[LevelView] // current pipeline read view, set under mu
+	mu   sync.Mutex                 // writers
 	// base is what Set gave; overrides are applied on top of it.
-	base      levelTable
+	base      LevelView
 	overrides map[string]override
 	timer     *time.Timer
 	// stopped: the Logs closed; no timer runs again.
@@ -40,13 +43,14 @@ type override struct {
 	until time.Time
 }
 
-type levelTable struct {
+// LevelView is an immutable snapshot of effective module levels.
+type LevelView struct {
 	def     slog.Level
 	modules map[string]slog.Level
-	min     slog.Level // the lowest level of all, for a quick Enabled
 }
 
-func (t *levelTable) of(module string) slog.Level {
+// Of returns the effective level of module in this snapshot.
+func (t *LevelView) Of(module string) slog.Level {
 	if l, ok := t.modules[module]; ok {
 		return l
 	}
@@ -54,13 +58,28 @@ func (t *levelTable) of(module string) slog.Level {
 }
 
 func newLevels() *Levels {
-	l := &Levels{base: levelTable{def: slog.LevelInfo}}
+	l := &Levels{base: LevelView{def: slog.LevelInfo}}
 	l.publish()
 	return l
 }
 
 // Of returns the level of module now.
-func (l *Levels) Of(module string) slog.Level { return l.cur.Load().of(module) }
+func (l *Levels) Of(module string) slog.Level {
+	if t := l.cur.Load(); t != nil {
+		return t.Of(module)
+	}
+	return slog.LevelInfo
+}
+
+func levelAllows(minimum, level slog.Level) bool { return minimum != LevelOff && level >= minimum }
+
+// moreVerbose combines thresholds, treating off as stricter than any level.
+func moreVerbose(a, b slog.Level) slog.Level {
+	if a == LevelOff || (b != LevelOff && b < a) {
+		return b
+	}
+	return a
+}
 
 // Set replaces the default and per-module levels as spec says,
 // "info,db=debug,net=warn". Overrides stay until they expire.
@@ -107,11 +126,7 @@ func (l *Levels) Override(module string, level slog.Level, ttl time.Duration) er
 		limit = 1024
 	}
 	now := time.Now()
-	for m, o := range l.overrides {
-		if !now.Before(o.until) {
-			delete(l.overrides, m) // expired; its timer may not have run yet
-		}
-	}
+	l.expire(now)
 	if _, ok := l.overrides[module]; !ok && len(l.overrides) >= limit {
 		return ErrTooManyOverrides
 	}
@@ -121,6 +136,14 @@ func (l *Levels) Override(module string, level slog.Level, ttl time.Duration) er
 	l.overrides[module] = override{level: level, until: now.Add(ttl)}
 	l.publish()
 	return nil
+}
+
+func (l *Levels) expire(now time.Time) {
+	for m, o := range l.overrides {
+		if !now.Before(o.until) {
+			delete(l.overrides, m) // expired; its timer may not have run yet
+		}
+	}
 }
 
 // Clear ends the override of module now; module returns to what Set gave.
@@ -135,13 +158,10 @@ func (l *Levels) Clear(module string) {
 // default ("") applies to every module; a module's own one to it alone.
 func (l *Levels) publish() {
 	now := time.Now()
+	l.expire(now)
 	defOverride := LevelOff
 	var next time.Time
 	for m, r := range l.overrides {
-		if !now.Before(r.until) {
-			delete(l.overrides, m)
-			continue
-		}
 		if next.IsZero() || r.until.Before(next) {
 			next = r.until
 		}
@@ -149,24 +169,19 @@ func (l *Levels) publish() {
 			defOverride = r.level
 		}
 	}
-	t := levelTable{def: min(l.base.def, defOverride), modules: make(map[string]slog.Level, len(l.base.modules)+len(l.overrides))}
+	t := LevelView{def: moreVerbose(l.base.def, defOverride), modules: make(map[string]slog.Level, len(l.base.modules)+len(l.overrides))}
 	for m, v := range l.base.modules {
-		t.modules[m] = min(v, defOverride)
+		t.modules[m] = moreVerbose(v, defOverride)
 	}
 	for m, r := range l.overrides {
 		if m != "" {
-			base, ok := l.base.modules[m]
-			if !ok {
-				base = l.base.def
-			}
-			t.modules[m] = min(base, defOverride, r.level)
+			t.modules[m] = moreVerbose(t.Of(m), r.level)
 		}
 	}
-	t.min = t.def
-	for _, v := range t.modules {
-		t.min = min(t.min, v)
-	}
 	l.cur.Store(&t)
+	if l.view != nil {
+		l.view.Store(&t)
+	}
 	if l.timer != nil {
 		l.timer.Stop()
 		l.timer = nil
@@ -183,19 +198,22 @@ func (l *Levels) publish() {
 }
 
 // configure is Set with a parsed table, and the override limit.
-func (l *Levels) configure(t levelTable, maxOverrides int) {
+func (l *Levels) configure(t LevelView, maxOverrides int, view *atomic.Pointer[LevelView]) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.base = t
+	l.view = view
 	l.maxOverrides = maxOverrides
 	l.stopped = false // Configure after Close starts afresh
 	l.publish()
 }
 
 // stop ends the expiry timer and the overrides for good.
-func (l *Levels) stop() {
+func (l *Levels) stop() { l.stopView(nil) }
+func (l *Levels) stopView(view *atomic.Pointer[LevelView]) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.view = view
 	l.stopped = true
 	l.overrides = nil
 	if l.timer != nil {
@@ -229,15 +247,29 @@ func (l *Levels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Module *string `json:"module"`
 			Level  string  `json:"level"`
-			TTL    string  `json:"ttl"`
+			TTL    *string `json:"ttl"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if dec.Decode(new(any)) != io.EOF {
+			http.Error(w, "unexpected trailing input", http.StatusBadRequest)
+			return
+		}
 		var err error
+		var ttlText string
+		if req.TTL != nil {
+			ttlText = strings.TrimSpace(*req.TTL)
+		}
 		switch {
-		case req.Module != nil && strings.TrimSpace(req.TTL) == "0":
+		case req.Module == nil && req.TTL != nil:
+			err = errors.New("ttl requires module")
+		case req.Module != nil && ttlText == "0" && req.Level != "":
+			err = errors.New("clear takes no level")
+		case req.Module != nil && ttlText == "0":
 			l.Clear(*req.Module)
 		case strings.TrimSpace(req.Level) == "":
 			err = errors.New("level is required")
@@ -247,7 +279,7 @@ func (l *Levels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var lv slog.Level
 			var ttl time.Duration
 			if lv, err = ParseLevel(req.Level); err == nil {
-				ttl, err = time.ParseDuration(req.TTL)
+				ttl, err = time.ParseDuration(ttlText)
 			}
 			if err == nil {
 				err = l.Override(*req.Module, lv, ttl)
@@ -268,7 +300,7 @@ func (l *Levels) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if st.Overrides == nil {
 			st.Overrides = map[string]string{}
 		}
-		st.Overrides[m] = strings.ToLower(LevelName(rs.level)) + " until " + rs.until.UTC().Format(time.RFC3339)
+		st.Overrides[m] = levelWord(rs.level) + " until " + rs.until.UTC().Format(time.RFC3339)
 	}
 	l.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -300,8 +332,8 @@ func ParseLevel(s string) (slog.Level, error) {
 	return 0, fmt.Errorf("unknown log level %q", s)
 }
 
-func parseLevels(spec string) (levelTable, error) {
-	t := levelTable{def: slog.LevelInfo}
+func parseLevels(spec string) (LevelView, error) {
+	t := LevelView{def: slog.LevelInfo}
 	for part := range strings.SplitSeq(spec, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -311,18 +343,21 @@ func parseLevels(spec string) (levelTable, error) {
 		if !ok {
 			l, err := ParseLevel(part)
 			if err != nil {
-				return levelTable{}, err
+				return LevelView{}, err
 			}
 			t.def = l
 			continue
 		}
+		if strings.TrimSpace(name) == "" {
+			return LevelView{}, errors.New("missing module level")
+		}
 		l, err := ParseLevel(name)
 		if err != nil {
-			return levelTable{}, err
+			return LevelView{}, err
 		}
 		mod = strings.TrimSpace(mod)
 		if mod == "" {
-			return levelTable{}, errors.New("log level without a module: " + part)
+			return LevelView{}, errors.New("log level without a module: " + part)
 		}
 		if t.modules == nil {
 			t.modules = map[string]slog.Level{}
@@ -333,13 +368,13 @@ func parseLevels(spec string) (levelTable, error) {
 }
 
 func levelWord(l slog.Level) string {
-	if l >= LevelOff {
+	if l == LevelOff {
 		return "off"
 	}
 	return strings.ToLower(LevelName(l))
 }
 
-func formatLevels(t levelTable) string {
+func formatLevels(t LevelView) string {
 	parts := make([]string, 0, 1+len(t.modules))
 	parts = append(parts, levelWord(t.def))
 	mods := make([]string, 0, len(t.modules))

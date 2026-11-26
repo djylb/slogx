@@ -16,6 +16,7 @@ import (
 )
 
 type memOut struct {
+	logs  *Logs
 	mu    sync.Mutex
 	lines []string
 }
@@ -28,6 +29,9 @@ func (m *memOut) Write(p []byte) error {
 }
 func (m *memOut) Close() error { return nil }
 func (m *memOut) all() string {
+	if m.logs != nil {
+		_ = m.logs.Flush()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return strings.Join(m.lines, "")
@@ -39,10 +43,11 @@ func withRoute(t *testing.T, c Config, enc Encoder) (*Logs, *memOut) {
 	c.Console = ConsoleOff
 	c.Routes = append(c.Routes, Route{Name: "t", Encoder: enc, Output: o})
 	l := New()
+	o.logs = l
 	if err := l.Configure(c); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(l.Close)
+	t.Cleanup(func() { _ = l.Close() })
 	return l, o
 }
 
@@ -54,6 +59,7 @@ func newRouted(t *testing.T, c Config) (*Logs, *memOut) {
 	c.Console = ConsoleOff
 	c.Routes = append(c.Routes, Route{Name: "t", Output: o})
 	l := New()
+	o.logs = l
 	if err := l.Configure(c); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +69,7 @@ func newRouted(t *testing.T, c Config) (*Logs, *memOut) {
 func TestOverrideExpires(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l, o := newRouted(t, Config{Level: "warn"})
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		m := l.Module("net")
 		m.Debug("before")
 		if err := l.Levels().Override("net", slog.LevelDebug, 10*time.Minute); err != nil {
@@ -92,7 +98,7 @@ func TestLimitWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := &Def{Name: "limited_ev", Level: slog.LevelInfo, Limit: "src_ip"}
 		l, o := newRouted(t, Config{})
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		m := l.Module("x")
 		for range 3 {
 			Emit(context.Background(), m, d, "src_ip", "1.1.1.1")
@@ -109,7 +115,7 @@ func TestLimitWindow(t *testing.T) {
 
 func TestLevelsHTTP(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	srv := httptest.NewServer(l.Levels())
 	defer srv.Close()
 	put := func(body string) int {
@@ -207,7 +213,7 @@ func TestMemoryQueryAndSubscribe(t *testing.T) {
 	if err := l.Configure(Config{Console: ConsoleOff, Level: "debug", Memory: 3}); err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	m := l.Memory()
 	ctx, cancel := context.WithCancel(context.Background())
 	sub := m.Subscribe(ctx, Query{MinLevel: slog.LevelWarn}, 4)
@@ -310,7 +316,7 @@ func TestEmitMessage(t *testing.T) {
 
 func TestNilMemory(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	m := l.Memory()
 	if m != nil || m.Size() != 0 || m.Query(Query{}) != nil || m.Take() != nil || m.Text(Query{}, TextEncoder{}) != "" {
 		t.Fatal("nil Memory not empty")
@@ -324,7 +330,7 @@ func TestNilMemory(t *testing.T) {
 
 func TestConfigRejectsUnknownEnums(t *testing.T) {
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if l.Configure(Config{Console: ConsoleOff + 1}) == nil || l.Configure(Config{Format: Pretty + 1}) == nil {
 		t.Fatal("unknown Console or Format accepted")
 	}

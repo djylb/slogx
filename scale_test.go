@@ -41,47 +41,53 @@ func TestInflightCloseWaitsForLines(t *testing.T) {
 	}
 }
 
-// TestRetiredOutputsSeeNoLines writes from many goroutines across
-// Configure: no line may reach an output after it was closed.
+// Pause an owned-by-caller write while its route is replaced.
 func TestRetiredOutputsSeeNoLines(t *testing.T) {
-	l := New()
-	defer l.Close()
-	stop := make(chan struct{})
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		m := l.Module("x")
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				m.Info("m")
-			}
-		}
-	}()
-	for range 50 {
-		o := &closeCheck{t: t}
-		if err := l.Configure(Config{Console: ConsoleOff, Routes: []Route{{Output: o}}}); err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		l := New()
+		defer func() { _ = l.Close() }()
+		out := &closeCheck{entered: make(chan struct{}), release: make(chan struct{})}
+		if err := l.Configure(Config{Console: ConsoleOff, Routes: []Route{{Output: out}}}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	close(stop)
-	<-finished
+		l.Module("old").Info("one")
+		<-out.entered
+		done := make(chan error, 1)
+		go func() { done <- l.Configure(Config{Console: ConsoleOff, Memory: 1}) }()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("retired during Write: %v", err)
+		default:
+		}
+		l.Module("new").Info("two")
+		close(out.release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		_ = out.Close()
+		l.Module("new").Info("three")
+		if out.after != 0 || len(l.Memory().Take()) != 1 {
+			t.Fatal("incorrect handover")
+		}
+	})
 }
 
 type closeCheck struct {
-	t      *testing.T
-	closed bool // written by Close, read by Write: the race detector checks the hand-over
+	entered, release chan struct{}
+	closed           bool
+	after            int
 }
 
 func (c *closeCheck) Write([]byte) error {
 	if c.closed {
-		c.t.Error("line written after Close")
+		c.after++
+		return os.ErrClosed
 	}
+	close(c.entered)
+	<-c.release
 	return nil
 }
-
 func (c *closeCheck) Close() error { c.closed = true; return nil }
 
 func readFile(t *testing.T, path string) string {
@@ -137,13 +143,14 @@ func TestRotatingBufferGoesToOldFile(t *testing.T) {
 	}
 	_ = r.Write([]byte("first\n"))
 	_ = r.Write([]byte("second\n")) // past MaxSize: rotates
+	file := r.file.Load()
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, path); got != "second\n" {
 		t.Fatalf("current file %q", got)
 	}
-	files := r.rotatedFiles()
+	files := file.rotatedFiles()
 	old := make([]string, 0, len(files))
 	for _, f := range files {
 		old = append(old, readFile(t, f.path))
@@ -212,7 +219,7 @@ func TestContextAppendDoesNotAllocate(t *testing.T) {
 		t.Skip("the race detector allocates")
 	}
 	l := New()
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if err := l.Configure(Config{Console: ConsoleOff, Routes: []Route{{Output: discard{}}}, ContextAppend: func(ctx context.Context, dst []slog.Attr) []slog.Attr {
 		if v, ok := ctx.Value(reqKey{}).(string); ok {
 			dst = append(dst, slog.String("req", v), slog.String("user", "u"))
@@ -394,7 +401,7 @@ func TestSamplerGrowsUnderContention(t *testing.T) {
 	<-finished
 	sm.collisions.Store(growAfter - 1) // the next wait makes it grow by itself
 	set = sm.set.Load()
-	key := sampleKey{a: "0"}
+	key := sampleKey{a: "0", policy: Sampling{First: 1, Tick: time.Minute}}
 	sh = &set.shards[maphash.Comparable(sm.seed, key)&set.mask] // the shard the line will wait on
 	sh.mu.Lock()
 	grown := make(chan struct{})
@@ -402,7 +409,10 @@ func TestSamplerGrowsUnderContention(t *testing.T) {
 		defer close(grown)
 		sm.allow(key, s, now)
 	}()
-	for sm.collisions.Load() != 0 { // reset once the line decided to grow
+	// At the stripe limit the grow attempt returns immediately and retries
+	// the held shard. The counter may already have advanced from zero.
+	deadline = time.Now().Add(5 * time.Second)
+	for sm.collisions.Load() == growAfter-1 {
 		if time.Now().After(deadline) {
 			sh.mu.Unlock()
 			t.Fatal("a line waiting on the lock never decided to grow")
@@ -428,9 +438,10 @@ func TestRotatingTimedFlushErrorIsReturned(t *testing.T) {
 		}
 		defer func() { _ = r.Close() }()
 		_ = r.Write([]byte("x\n"))
-		r.mu.Lock()
-		_ = r.f.Close() // the timed flush will fail
-		r.mu.Unlock()
+		file := r.file.Load()
+		file.mu.Lock()
+		_ = file.f.Close() // the timed flush will fail
+		file.mu.Unlock()
 		time.Sleep(defaultFlushInterval)
 		synctest.Wait()
 		if err := r.Write([]byte("y\n")); err == nil {
@@ -454,7 +465,7 @@ func TestSamplerGrowthMergesOverflow(t *testing.T) {
 	}
 	overflow := func(set *sampleSet) (slots int, suppressed uint64) {
 		for i := range set.shards {
-			if sl, ok := set.shards[i].seen[sampleKey{overflow: true}]; ok {
+			if sl, ok := set.shards[i].seen[sampleKey{overflow: true, policy: Sampling{First: 1, Tick: limitWindow}}]; ok {
 				slots++
 				suppressed += sl.suppressed
 			}
@@ -476,4 +487,9 @@ func TestSamplerGrowthMergesOverflow(t *testing.T) {
 	if slots, after := overflow(sm.set.Load()); slots != 1 || after != before {
 		t.Fatalf("after growth %d overflow slots, %d suppressed, want 1 and %d", slots, after, before)
 	}
+}
+
+func (r *rotatingFile) rotatedFiles() []rotated {
+	files, _ := r.scan()
+	return files
 }

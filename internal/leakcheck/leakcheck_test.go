@@ -1,15 +1,25 @@
 package leakcheck
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
 )
 
-// No VerifyTestMain here: TestFindMarksUnreachable leaks on purpose.
+const leakChild = "SLOGX_LEAKCHECK_CHILD"
 
-// running returns the ids of the goroutines running now: the tests may run
-// in any order, and TestFindMarksUnreachable leaves one behind.
+func TestMain(m *testing.M) {
+	if os.Getenv(leakChild) == "1" {
+		os.Exit(m.Run())
+	}
+	VerifyTestMain(m)
+}
+
 func running() map[uint64]bool {
 	ids := map[uint64]bool{}
 	for _, g := range goroutines() {
@@ -36,6 +46,26 @@ func TestFind(t *testing.T) {
 }
 
 func TestFindMarksUnreachable(t *testing.T) {
+	if runtime.GOARCH == "wasm" {
+		t.Skip("isolating a permanently leaked goroutine requires a subprocess")
+	}
+	if pprof.Lookup("goroutineleak") == nil {
+		t.Skip("runtime without leak profile")
+	}
+	if os.Getenv(leakChild) != "1" {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestFindMarksUnreachable$")
+		cmd.Env = append(os.Environ(), leakChild+"=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		return
+	}
 	go func() {
 		ch := make(chan int)
 		<-ch // no other goroutine can reach ch: leaked for good
@@ -45,7 +75,7 @@ func TestFindMarksUnreachable(t *testing.T) {
 		t.Fatal("find with a leaked goroutine = nil")
 	}
 	if !strings.Contains(err.Error(), "goroutineleak profile") {
-		t.Skipf("runtime without the goroutineleak profile:\n%v", err)
+		t.Fatalf("missing goroutineleak profile:\n%v", err)
 	}
 }
 

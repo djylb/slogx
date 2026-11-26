@@ -1,6 +1,7 @@
 package slogx
 
 import (
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -38,7 +39,10 @@ type writerOutput struct {
 func (o *writerOutput) Write(p []byte) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	_, err := o.w.Write(p)
+	n, err := o.w.Write(p)
+	if err == nil && n != len(p) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -54,12 +58,16 @@ func (o *writerOutput) Close() error {
 
 // Async returns an Output that hands lines to o on a goroutine of its own
 // through a queue of size lines. A line that does not fit is dropped and
-// counted rather than blocking the caller. Flush waits until the queue is
-// empty; Close flushes and closes o. Both wait for o, so if o stalls, they
+// counted rather than blocking the caller. Flush waits for earlier writes
+// and flushes o. Close drains and closes o. Both wait for o, so if o stalls, they
 // stall too.
 func Async(o Output, size int) *AsyncOutput {
+	return newAsync(o, size, true)
+}
+
+func newAsync(o Output, size int, owns bool) *AsyncOutput {
 	a := &AsyncOutput{out: o, q: make(chan asyncItem, max(size, 1)), done: make(chan struct{})}
-	go a.run()
+	a.owns = owns
 	return a
 }
 
@@ -70,38 +78,120 @@ type AsyncOutput struct {
 	// many were dropped since the last call. It may log: the queue has room.
 	OnDrop func(dropped uint64)
 
+	slots    sync.Once
+	free     chan *lineSlot
+	idleExit bool // fallback queues outlive Logs.Close
+	running  atomic.Bool
+	pending  error // accessed only by the active worker
+	total    *atomic.Uint64
+	failures *atomic.Uint64
 	out      Output
 	q        chan asyncItem
 	done     chan struct{}
 	dropped  atomic.Uint64
 	reported uint64 // run goroutine only
 	closeMu  sync.RWMutex
+	barriers sync.WaitGroup
+	result   error
+	owns     bool
 	closed   bool
 }
 
 type asyncItem struct {
-	line  *[]byte // from bufPool, returned once written
-	flush chan struct{}
+	line   *lineSlot
+	reply  chan error
+	reopen bool
+	final  bool
+}
+
+// Each queued line owns a slot until the worker finishes writing it. Short
+// lines fit inline even when a burst fills a previously idle queue.
+type lineSlot struct {
+	line   []byte
+	inline [256]byte
+}
+
+func (a *AsyncOutput) initSlots() {
+	slots := make([]lineSlot, cap(a.q)+1)
+	a.free = make(chan *lineSlot, len(slots))
+	for i := range slots {
+		slots[i].line = slots[i].inline[:0]
+		a.free <- &slots[i]
+	}
 }
 
 func (a *AsyncOutput) run() {
-	defer close(a.done)
-	for it := range a.q {
-		if it.flush != nil {
-			if f, ok := a.out.(Flusher); ok {
-				_ = f.Flush()
+	for {
+		var it asyncItem
+		select {
+		case it = <-a.q:
+		default:
+			if !a.idleExit {
+				it = <-a.q
+				break
 			}
-			close(it.flush)
+			// Hand ownership back to producers. Recheck for an enqueue
+			// whose producer still saw this worker running.
+			a.running.Store(false)
+			if len(a.q) > 0 && a.running.CompareAndSwap(false, true) {
+				continue
+			}
+			return
+		}
+		if it.final {
+			a.reportDrops()
+			a.result = errors.Join(a.pending, flushOutput(a.out))
+			if a.owns {
+				a.result = errors.Join(a.result, a.out.Close())
+			}
+			close(a.done)
+			return
+		}
+		if it.reply != nil {
+			err := flushOutput(a.out)
+			if it.reopen {
+				err = errors.Join(err, reopenOutput(a.out))
+			}
+			it.reply <- errors.Join(a.pending, err)
+			a.pending = nil
 		} else {
-			_ = a.out.Write(*it.line)
-			putBuf(it.line)
-		}
-		if len(a.q) == 0 && a.OnDrop != nil {
-			if n := a.dropped.Load(); n > a.reported {
-				a.OnDrop(n - a.reported)
-				a.reported = n
+			if err := a.out.Write(it.line.line); err != nil {
+				if a.failures != nil {
+					a.failures.Add(1)
+				}
+				if a.pending == nil {
+					a.pending = err
+				}
 			}
+			if cap(it.line.line) > 64<<10 {
+				it.line.line = it.line.inline[:0]
+			}
+			a.free <- it.line
 		}
+		if len(a.q) == 0 {
+			a.reportDrops()
+		}
+	}
+}
+
+func (a *AsyncOutput) reportDrops() {
+	if n := a.dropped.Load(); n > a.reported {
+		if a.OnDrop != nil {
+			a.OnDrop(n - a.reported)
+		}
+		a.reported = n
+	}
+}
+
+func (a *AsyncOutput) startWorker() {
+	if a.running.CompareAndSwap(false, true) {
+		go a.run()
+	}
+}
+func (a *AsyncOutput) drop() {
+	a.dropped.Add(1)
+	if a.total != nil {
+		a.total.Add(1)
 	}
 }
 
@@ -110,20 +200,26 @@ func (a *AsyncOutput) run() {
 func (a *AsyncOutput) Write(p []byte) error {
 	a.closeMu.RLock()
 	defer a.closeMu.RUnlock()
-	if a.closed {
+	if a.q == nil || a.closed {
 		return os.ErrClosed
 	}
 	if len(a.q) == cap(a.q) { // full: drop without copying
-		a.dropped.Add(1)
+		a.drop()
 		return nil
 	}
-	bp := bufPool.Get().(*[]byte)
-	*bp = append((*bp)[:0], p...)
+	a.slots.Do(a.initSlots)
 	select {
-	case a.q <- asyncItem{line: bp}:
+	case slot := <-a.free:
+		slot.line = append(slot.line[:0], p...)
+		select {
+		case a.q <- asyncItem{line: slot}:
+			a.startWorker()
+		default:
+			a.free <- slot
+			a.drop()
+		}
 	default:
-		putBuf(bp)
-		a.dropped.Add(1)
+		a.drop()
 	}
 	return nil
 }
@@ -133,36 +229,55 @@ func (a *AsyncOutput) Dropped() uint64 { return a.dropped.Load() }
 
 // Flush waits until the lines queued before it are written and o flushed.
 func (a *AsyncOutput) Flush() error {
+	return a.barrier(false)
+}
+
+func flushOutput(o Output) error {
+	if f, ok := o.(Flusher); ok {
+		return f.Flush()
+	}
+	return nil
+}
+func reopenOutput(o Output) error {
+	if f, ok := o.(Reopener); ok {
+		return f.Reopen()
+	}
+	return nil
+}
+
+// Reopen flushes earlier lines before reopening the underlying output.
+func (a *AsyncOutput) Reopen() error { return a.barrier(true) }
+
+func (a *AsyncOutput) barrier(reopen bool) error {
 	a.closeMu.RLock()
-	if a.closed {
+	if a.q == nil || a.closed {
 		a.closeMu.RUnlock()
-		return nil
+		return os.ErrClosed
 	}
-	c := make(chan struct{})
-	a.q <- asyncItem{flush: c}
+	a.barriers.Add(1)
 	a.closeMu.RUnlock()
-	<-c
-	return nil
+	defer a.barriers.Done()
+	reply := make(chan error)
+	a.q <- asyncItem{reply: reply, reopen: reopen}
+	a.startWorker()
+	return <-reply
 }
 
-// Reopen reopens o when it is a Reopener.
-func (a *AsyncOutput) Reopen() error {
-	if r, ok := a.out.(Reopener); ok {
-		return r.Reopen()
-	}
-	return nil
-}
-
-// Close writes what is queued, then closes o; writes after it fail.
+// Close drains the queue and returns the final flush and close result.
 func (a *AsyncOutput) Close() error {
 	a.closeMu.Lock()
-	if a.closed {
+	if a.q == nil {
 		a.closeMu.Unlock()
 		return nil
 	}
+	first := !a.closed
 	a.closed = true
-	close(a.q)
 	a.closeMu.Unlock()
+	if first {
+		a.barriers.Wait()
+		a.q <- asyncItem{final: true}
+		a.startWorker()
+	}
 	<-a.done
-	return a.out.Close()
+	return a.result
 }

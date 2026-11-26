@@ -3,10 +3,12 @@ package slogx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"net"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -63,10 +65,17 @@ func StdLogger(l *slog.Logger, level slog.Level) *log.Logger {
 
 // CaptureStdLog sends the standard library's default logger, which some
 // libraries write to, to l at level: StdLogger for log's default logger.
-func CaptureStdLog(l *slog.Logger, level slog.Level) {
+// The target must write independently of the default log.Logger.
+func CaptureStdLog(l *slog.Logger, level slog.Level) error {
+	// slog's initial handler (including WithAttrs/WithGroup derivatives)
+	// calls log.Output. Its concrete type is private to log/slog.
+	if typ := reflect.TypeOf(l.Handler()); typ.Kind() == reflect.Pointer && typ.Elem().PkgPath() == "log/slog" && typ.Elem().Name() == "defaultHandler" {
+		return errors.New("slogx: capture target writes back to the standard logger")
+	}
 	log.SetFlags(0)
 	log.SetPrefix("")
 	log.SetOutput(lineWriter{l: l, level: level})
+	return nil
 }
 
 // HTTPErrorLog returns a logger for http.Server.ErrorLog: TLS handshake
@@ -80,14 +89,17 @@ func HTTPErrorLog(l *slog.Logger, listener string) *log.Logger {
 
 // parseTLSHandshake reads "http: TLS handshake error from <addr>: <err>".
 func parseTLSHandshake(l *slog.Logger, listener, msg string, pc uintptr) bool {
-	_, rest, ok := strings.Cut(msg, "TLS handshake error from ")
+	rest, ok := strings.CutPrefix(msg, "http: TLS handshake error from ")
 	if !ok {
 		return false
 	}
-	addr, why, _ := strings.Cut(rest, ": ")
+	addr, why, ok := strings.Cut(rest, ": ")
+	if !ok || why == "" {
+		return false
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		host = addr
+		return false
 	}
 	emit(context.Background(), l, &tlsHandshakeFailed, pc, []any{"src_ip", host, "src_port", port, "listener", listener, "reason", tlsReason(why)})
 	return true

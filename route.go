@@ -1,36 +1,39 @@
 package slogx
 
 import (
+	"errors"
 	"log/slog"
+	"slices"
 )
 
 // Match decides whether a route takes a record. lv is the level table of
 // the Logs the route belongs to, with its overrides applied, for a Match
 // that compares a record with its module's level (as MatchLevels does);
 // other matches may ignore it. A Match must not keep r or lv.
-type Match func(r *Record, lv *Levels) bool
+type Match func(r *Record, lv *LevelView) bool
 
 // MatchLevels takes records at or above the level lv gives their module:
 // the main log. It is the Match of a Route without one.
-func MatchLevels(r *Record, lv *Levels) bool { return r.Level >= lv.Of(r.Module) }
+func MatchLevels(r *Record, lv *LevelView) bool { return levelAllows(lv.Of(r.Module), r.Level) }
 
 // MatchSecurity takes the events defined as security events, whatever the
 // levels.
-func MatchSecurity(r *Record, _ *Levels) bool { return r.Def != nil && r.Def.Security }
+func MatchSecurity(r *Record, _ *LevelView) bool { return r.Def != nil && r.Def.Security }
 
 // MatchBus takes the events defined as bus events, whatever the levels.
-func MatchBus(r *Record, _ *Levels) bool { return r.Def != nil && r.Def.Bus }
+func MatchBus(r *Record, _ *LevelView) bool { return r.Def != nil && r.Def.Bus }
 
 // MatchMinLevel takes records at or above level, whatever the module
-// levels. Records below the level table reach it only on a Route with
-// Below set.
+// levels. Below admits ordinary records below the module threshold.
+// Security and bus events reach the matcher regardless of Below.
 func MatchMinLevel(level slog.Level) Match {
-	return func(r *Record, _ *Levels) bool { return r.Level >= level }
+	return func(r *Record, _ *LevelView) bool { return levelAllows(level, r.Level) }
 }
 
-// MatchAny takes what any of ms takes.
+// MatchAny takes what any non-nil match takes. It snapshots ms.
 func MatchAny(ms ...Match) Match {
-	return func(r *Record, lv *Levels) bool {
+	ms = slices.DeleteFunc(slices.Clone(ms), func(m Match) bool { return m == nil })
+	return func(r *Record, lv *LevelView) bool {
 		for _, m := range ms {
 			if m(r, lv) {
 				return true
@@ -40,9 +43,10 @@ func MatchAny(ms ...Match) Match {
 	}
 }
 
-// MatchAll takes what all of ms take.
+// MatchAll takes what every non-nil match takes. It snapshots ms.
 func MatchAll(ms ...Match) Match {
-	return func(r *Record, lv *Levels) bool {
+	ms = slices.DeleteFunc(slices.Clone(ms), func(m Match) bool { return m == nil })
+	return func(r *Record, lv *LevelView) bool {
 		for _, m := range ms {
 			if !m(r, lv) {
 				return false
@@ -78,6 +82,9 @@ func (rt *Route) validate() error {
 		n++
 	}
 	if rt.Memory != nil {
+		if rt.Memory.Size() == 0 {
+			return errors.New("slogx: route requires initialized memory")
+		}
 		n++
 	}
 	if rt.Func != nil {
@@ -89,9 +96,12 @@ func (rt *Route) validate() error {
 	return nil
 }
 
-func (rt *Route) takes(r *Record, lv *Levels) bool {
+func (rt *Route) takes(r *Record, lv *LevelView) bool {
 	if rt.Match == nil {
 		return MatchLevels(r, lv)
+	}
+	if !rt.Below && (r.Def == nil || (!r.Def.Security && !r.Def.Bus)) && !MatchLevels(r, lv) {
+		return false
 	}
 	return rt.Match(r, lv)
 }

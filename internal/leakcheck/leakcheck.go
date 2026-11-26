@@ -1,3 +1,5 @@
+// Code generated from the pinned shared leakcheck source. DO NOT EDIT.
+
 // Package leakcheck checks test binaries for leaked goroutines: Find lists
 // the goroutines still running besides the caller, the test framework's and
 // the runtime's own, waiting a while for them to end first, and
