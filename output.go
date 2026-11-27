@@ -79,9 +79,8 @@ type AsyncOutput struct {
 	OnDrop func(dropped uint64)
 
 	slots    sync.Once
-	free     chan *lineSlot
-	idleExit bool // fallback queues outlive Logs.Close
 	running  atomic.Bool
+	free     chan *lineSlot
 	pending  error // accessed only by the active worker
 	total    *atomic.Uint64
 	failures *atomic.Uint64
@@ -93,6 +92,7 @@ type AsyncOutput struct {
 	closeMu  sync.RWMutex
 	barriers sync.WaitGroup
 	result   error
+	idleExit bool // fallback queues outlive Logs.Close
 	owns     bool
 	closed   bool
 }

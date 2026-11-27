@@ -59,10 +59,6 @@ linters:
   settings:
     govet:
       enable-all: true
-      disable:
-        # Checked separately with fieldalignment. Keep field order where
-        # reordering only reduces pointer bytes or changes public layout.
-        - fieldalignment
     exhaustive:
       default-signifies-exhaustive: true
     tagliatelle:
@@ -75,9 +71,11 @@ linters:
       require-explanation: true
       require-specific: true
   exclusions:
-    paths:
-      - ^internal/leakcheck/leakcheck\.go$
     rules:
+      # Keep field order when reordering only reduces pointer data.
+      - linters:
+          - govet
+        text: '^fieldalignment: .* has [0-9]+ leading bytes of pointer data but optimal value is [0-9]+$'
       # Tests build errors in place, repeat their case names and unpack
       # fixtures they partly ignore; they open files and run the test
       # binary by path.
