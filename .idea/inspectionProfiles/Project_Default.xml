@@ -1,0 +1,7 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <!-- Field layout is checked separately with fieldalignment. -->
+    <inspection_tool class="GoStructLayout" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+  </profile>
+</component>

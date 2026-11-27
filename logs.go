@@ -119,7 +119,6 @@ type Logs struct {
 // done.
 type pipeline struct {
 	levels    atomic.Pointer[LevelView]
-	secrets   atomic.Bool
 	routes    []Route
 	closers   []Output
 	inflight  inflight
@@ -128,6 +127,7 @@ type pipeline struct {
 	ctxAppend func(context.Context, []slog.Attr) []slog.Attr
 	attrs     []slog.Attr // Config.Attrs
 	sample    *Sampling
+	secrets   atomic.Bool
 	below     bool // a route sees lines below the level table
 	addSource bool
 }
@@ -139,6 +139,8 @@ func newPipeline() *pipeline {
 const defaultQueueSize = 1024
 
 func (l *Logs) consolePipeline(idleExit bool) *pipeline {
+	// The queue borrows stderr, which WriterOutput leaves open.
+	//goland:noinspection GoResourceLeak
 	q := l.queue(WriterOutput(os.Stderr), defaultQueueSize, "console")
 	q.idleExit = idleExit
 	return &pipeline{routes: []Route{{Name: "console", Output: q}}, closers: []Output{q}}

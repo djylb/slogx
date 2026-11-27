@@ -83,8 +83,7 @@ var activeFiles = struct {
 var errRotationConflict = errors.New("slogx: conflicting rotation for active file")
 
 type rotatingFile struct {
-	archiveMu   sync.Mutex // pairs archive name selection with plain-to-gzip publication
-	start       sync.Once
+	archiveMu   sync.Mutex    // pairs archive name selection with plain-to-gzip publication
 	done        chan struct{} // closed after the last handle finishes maintenance
 	refs        int           // guarded by activeFiles
 	deadline    time.Time
@@ -100,6 +99,7 @@ type rotatingFile struct {
 	opened      time.Time
 	size        int64
 	workers     sync.WaitGroup
+	start       sync.Once
 	mu          sync.Mutex
 	closed      bool
 }
@@ -149,6 +149,8 @@ func reserveRotating(c Rotation) (*Rotating, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The returned handle owns the reference and releases it in Close.
+	//goland:noinspection GoResourceLeak
 	f, err := reserveFile(c, path)
 	if err != nil {
 		return nil, err
@@ -469,6 +471,9 @@ func (r *Rotating) Reopen() error {
 	if old == nil {
 		return os.ErrClosed
 	}
+	// Reusing the old file or failing to flush releases the new reference.
+	// Otherwise the handle takes ownership and releases it in Close.
+	//goland:noinspection GoResourceLeak
 	target, err := reserveFile(old.cfg, r.path)
 	if err != nil {
 		return err

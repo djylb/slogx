@@ -18,12 +18,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 
 	"github.com/djylb/slogx"
 )
 
+//goland:noinspection GoUnusedGlobalVariable
 var loginFailed = slogx.Def{
 	Name:     "login_failed",
 	Level:    slog.LevelWarn,
@@ -33,22 +35,28 @@ var loginFailed = slogx.Def{
 }
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("logging failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() (err error) {
 	logs := slogx.New() // or slogx.Default with slogx.Module
-	defer logs.Close()
-	err := logs.Configure(slogx.Config{
+	defer func() { err = errors.Join(err, logs.Close()) }()
+	if err := logs.Configure(slogx.Config{
 		Level:        "info,db=debug",
 		File:         slogx.Rotation{Path: "/var/log/app/app.log", MaxSize: 64 << 20, MaxFiles: 5},
 		SecurityFile: slogx.Rotation{Path: "/var/log/app/security.log"},
 		Memory:       2000,
-	})
-	if err != nil {
-		slog.Error("log config", "err", err)
-		os.Exit(1)
+	}); err != nil {
+		return err
 	}
 
 	web := logs.Module("web")
 	web.Info("listening", "addr", ":8080")
 	slogx.Emit(context.Background(), web, &loginFailed, "src_ip", "192.0.2.7", "user", "admin")
+	return nil
 }
 ```
 

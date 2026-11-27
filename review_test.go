@@ -47,10 +47,10 @@ func TestConfigureWhileLogging(t *testing.T) {
 
 func TestRotatingWriteAfterClose(t *testing.T) {
 	r, err := OpenRotating(Rotation{Path: filepath.Join(t.TempDir(), "a.log")})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || r == nil {
+		t.Fatalf("OpenRotating = %v, %v", r, err)
 	}
-	_ = r.Close()
+	check(t, r.Close())
 	if !errors.Is(r.Write([]byte("x\n")), os.ErrClosed) {
 		t.Fatal("write after close did not fail")
 	}
@@ -83,14 +83,15 @@ func TestPruneLeavesOtherFiles(t *testing.T) {
 func TestRotationNamesAreUnique(t *testing.T) {
 	dir := t.TempDir()
 	r, err := OpenRotating(Rotation{Path: filepath.Join(dir, "a.log"), MaxSize: 4})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || r == nil {
+		t.Fatalf("OpenRotating = %v, %v", r, err)
 	}
+	defer func() { _ = r.Close() }()
 	file := r.file.Load()
 	for i := range 20 {
-		_ = r.Write([]byte{byte('a' + i), 'b', 'c', '\n'})
+		check(t, r.Write([]byte{byte('a' + i), 'b', 'c', '\n'}))
 	}
-	_ = r.Close()
+	check(t, r.Close())
 	files := file.rotatedFiles()
 	if len(files) != 19 {
 		t.Fatalf("%d rotated files, want 19 (none overwritten)", len(files))
@@ -118,14 +119,15 @@ func TestRotateEvery(t *testing.T) {
 func TestCompressAndPruneInOrder(t *testing.T) {
 	dir := t.TempDir()
 	r, err := OpenRotating(Rotation{Path: filepath.Join(dir, "a.log"), MaxSize: 8, MaxFiles: 3, Compress: true})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || r == nil {
+		t.Fatalf("OpenRotating = %v, %v", r, err)
 	}
+	defer func() { _ = r.Close() }()
 	file := r.file.Load()
 	for range 30 {
-		_ = r.Write([]byte("01234567\n"))
+		check(t, r.Write([]byte("01234567\n")))
 	}
-	_ = r.Close()
+	check(t, r.Close())
 	files := file.rotatedFiles()
 	if len(files) != 3 {
 		t.Fatalf("%d rotated files kept", len(files))

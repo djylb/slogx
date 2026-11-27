@@ -28,7 +28,10 @@ go.work.sum
 .env
 
 # Editor/IDE
-.idea/
+.idea/*
+!.idea/inspectionProfiles/
+.idea/inspectionProfiles/*
+!.idea/inspectionProfiles/Project_Default.xml
 .vscode/
 
 # Local working documents

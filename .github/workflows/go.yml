@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         if: matrix.go == 'go.mod'
+        # Both inputs are declared by setup-go v7.
+        #noinspection UndefinedParamsPresent
         with:
           go-version-file: go.mod
           cache: false

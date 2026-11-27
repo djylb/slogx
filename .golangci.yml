@@ -60,9 +60,8 @@ linters:
     govet:
       enable-all: true
       disable:
-        # Checked on its own, as fieldalignment; what remains are
-        # pointer-byte reports, for which fields keep their order of
-        # meaning.
+        # Checked separately with fieldalignment. Keep field order where
+        # reordering only reduces pointer bytes or changes public layout.
         - fieldalignment
     exhaustive:
       default-signifies-exhaustive: true
@@ -76,6 +75,8 @@ linters:
       require-explanation: true
       require-specific: true
   exclusions:
+    paths:
+      - ^internal/leakcheck/leakcheck\.go$
     rules:
       # Tests build errors in place, repeat their case names and unpack
       # fixtures they partly ignore; they open files and run the test

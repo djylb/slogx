@@ -138,11 +138,12 @@ func TestRotatingBufferGoesToOldFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.log")
 	r, err := OpenRotating(Rotation{Path: path, MaxSize: 10, BufferSize: 64, FlushInterval: -1})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || r == nil {
+		t.Fatalf("OpenRotating = %v, %v", r, err)
 	}
-	_ = r.Write([]byte("first\n"))
-	_ = r.Write([]byte("second\n")) // past MaxSize: rotates
+	defer func() { _ = r.Close() }()
+	check(t, r.Write([]byte("first\n")))
+	check(t, r.Write([]byte("second\n"))) // past MaxSize: rotates
 	file := r.file.Load()
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
