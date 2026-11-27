@@ -25,7 +25,6 @@ import (
 	"github.com/djylb/slogx"
 )
 
-//goland:noinspection GoUnusedGlobalVariable
 var loginFailed = slogx.Def{
 	Name:     "login_failed",
 	Level:    slog.LevelWarn,

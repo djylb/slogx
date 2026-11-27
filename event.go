@@ -47,7 +47,12 @@ func (d *Def) sampling() (Sampling, string, bool) {
 
 var (
 	registryMu sync.RWMutex
-	registry   = map[string]*Def{}
+	registry   = map[string]*Def{
+		logFallback.Name:        new(logFallback.clone()),
+		logDropped.Name:         new(logDropped.clone()),
+		logSecrets.Name:         new(logSecrets.clone()),
+		tlsHandshakeFailed.Name: new(tlsHandshakeFailed.clone()),
+	}
 )
 
 // Register lists defs for Registered, such as for generating documentation
@@ -122,9 +127,6 @@ var (
 	tlsHandshakeFailed = Def{Name: EventTLSHandshakeFailed, Level: slog.LevelDebug, Limit: "src_ip"}
 )
 
-//nolint:gochecknoinits // the built-in events must be registered before any Logs exists, as Register requires
-func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFailed) }
-
 // Emit writes event d at its level to l with the given attributes (as
 // slog's args), carrying the attributes of ctx (Config.ContextAppend). The line's
 // message is d.Msg, or the value of the first argument with the key KeyMsg
@@ -132,7 +134,7 @@ func init() { Register(&logFallback, &logDropped, &logSecrets, &tlsHandshakeFail
 // an attribute. A slogx handler routes security and bus events even below
 // the main log's threshold. Other handlers decide through Enabled.
 //
-//nolint:contextcheck // a nil ctx is accepted, as by slog, and means context.Background
+//nolint:contextcheck // A nil context means context.Background, as it does in slog.
 func Emit(ctx context.Context, l *slog.Logger, d *Def, args ...any) {
 	if ctx == nil {
 		ctx = context.Background()

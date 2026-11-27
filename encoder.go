@@ -153,7 +153,7 @@ type PrettyEncoder struct {
 
 // Encode implements Encoder.
 func (e PrettyEncoder) Encode(b []byte, r *Record) []byte {
-	b = r.Time.Local().AppendFormat(b, "15:04:05.000") //nolint:gosmopolitan // the console shows the local time of the person at it
+	b = r.Time.Local().AppendFormat(b, "15:04:05.000") //nolint:gosmopolitan // Pretty timestamps use the console's local time zone.
 	b = append(b, ' ')
 	name := LevelName(r.Level)
 	if e.Color {

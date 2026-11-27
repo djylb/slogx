@@ -16,9 +16,6 @@ var (
 	testQuiet = Def{Name: "test_quiet_bus", Level: slog.LevelDebug, Bus: true}
 )
 
-//nolint:gochecknoinits // the test events are registered before any Logs exists, as Register requires
-func init() { Register(&testAuth, &testLimit, &testQuiet) }
-
 func newBuffered(t *testing.T, level string) *Logs {
 	t.Helper()
 	l := New()

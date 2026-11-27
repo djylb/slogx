@@ -139,7 +139,7 @@ func newPipeline() *pipeline {
 const defaultQueueSize = 1024
 
 func (l *Logs) consolePipeline(idleExit bool) *pipeline {
-	// The queue borrows stderr, which WriterOutput leaves open.
+	// The pipeline owns and closes the queue, whose WriterOutput borrows stderr.
 	//goland:noinspection GoResourceLeak
 	q := l.queue(WriterOutput(os.Stderr), defaultQueueSize, "console")
 	q.idleExit = idleExit

@@ -321,7 +321,7 @@ func TestNilMemory(t *testing.T) {
 	if m != nil || m.Size() != 0 || m.Query(Query{}) != nil || m.Take() != nil || m.Text(Query{}, TextEncoder{}) != "" {
 		t.Fatal("nil Memory not empty")
 	}
-	// A nil Memory supports Subscribe and returns a closed subscription.
+	// Subscribe returns a closed subscription for the nil receiver exercised here.
 	//goland:noinspection GoMaybeNil
 	sub := m.Subscribe(context.Background(), Query{}, 4)
 	if _, ok := <-sub.C(); ok || sub.Dropped() != 0 {

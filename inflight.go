@@ -57,7 +57,7 @@ func stripeShift() uint {
 func (f *inflight) enter() (*atomic.Int64, bool) {
 	c := &f.n
 	if s := f.stripes.Load(); s != nil {
-		c = &s.c[rand.Uint32()&uint32(len(s.c)-1)].n //nolint:gosec // spreading load, not security
+		c = &s.c[rand.Uint32()&uint32(len(s.c)-1)].n //nolint:gosec // The random index only spreads contention across counters.
 	}
 	if v := c.Load(); !c.CompareAndSwap(v, v+1) {
 		c.Add(1)

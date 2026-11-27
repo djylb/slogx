@@ -149,7 +149,7 @@ func reserveRotating(c Rotation) (*Rotating, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The returned handle owns the reference and releases it in Close.
+	// The returned Rotating owns the reference and releases it in Close.
 	//goland:noinspection GoResourceLeak
 	f, err := reserveFile(c, path)
 	if err != nil {
@@ -471,8 +471,7 @@ func (r *Rotating) Reopen() error {
 	if old == nil {
 		return os.ErrClosed
 	}
-	// Reusing the old file or failing to flush releases the new reference.
-	// Otherwise the handle takes ownership and releases it in Close.
+	// The handle retains the reference after a successful switch and releases it immediately otherwise.
 	//goland:noinspection GoResourceLeak
 	target, err := reserveFile(old.cfg, r.path)
 	if err != nil {
@@ -703,7 +702,7 @@ func (r *rotatingFile) maintainFiles(files []rotated, compress compressor) error
 
 // compressFile returns the completed temporary gzip for publication.
 func compressFile(name string, mode os.FileMode) (string, error) {
-	in, err := os.Open(name) //nolint:gosec // name is a rotated file of this package, not input
+	in, err := os.Open(name) //nolint:gosec // The archive scan selects regular files with valid rotation names in the log's archive directory.
 	if err != nil {
 		return "", err
 	}
