@@ -70,6 +70,7 @@ func Async(o Output, size int) *AsyncOutput {
 func newAsync(o Output, size int, owns bool) *AsyncOutput {
 	a := &AsyncOutput{out: o, q: make(chan asyncItem, max(size, 1)), done: make(chan struct{})}
 	a.owns = owns
+	a.worker = a.run
 	return a
 }
 
@@ -88,6 +89,7 @@ type AsyncOutput struct {
 	failures *atomic.Uint64
 	out      Output
 	q        chan asyncItem
+	worker   func() // a.run, bound once: go a.run() would allocate per start
 	done     chan struct{}
 	dropped  atomic.Uint64
 	reported uint64 // run goroutine only
@@ -184,7 +186,7 @@ func (a *AsyncOutput) reportDrops() {
 
 func (a *AsyncOutput) startWorker() {
 	if a.running.CompareAndSwap(false, true) {
-		go a.run()
+		go a.worker()
 	}
 }
 func (a *AsyncOutput) drop() {
