@@ -57,7 +57,9 @@ func (o *writerOutput) Close() error {
 }
 
 // Async returns an Output that hands lines to o on a goroutine of its own
-// through a queue of size lines. A line that does not fit is dropped and
+// through a queue of size lines. The goroutine runs only while lines are
+// queued: it exits when the queue empties and starts again on the next
+// line, so an idle or unused queue holds no goroutine. A line that does not fit is dropped and
 // counted rather than blocking the caller. Flush waits for earlier writes
 // and flushes o. Close drains and closes o. Both wait for o, so if o stalls, they
 // stall too.
@@ -92,7 +94,6 @@ type AsyncOutput struct {
 	closeMu  sync.RWMutex
 	barriers sync.WaitGroup
 	result   error
-	idleExit bool // fallback queues outlive Logs.Close
 	owns     bool
 	closed   bool
 }
@@ -126,12 +127,10 @@ func (a *AsyncOutput) run() {
 		select {
 		case it = <-a.q:
 		default:
-			if !a.idleExit {
-				it = <-a.q
-				break
-			}
-			// Hand ownership back to producers. Recheck for an enqueue
-			// whose producer still saw this worker running.
+			// Exit when idle so no goroutine outlives the lines it carries;
+			// the next enqueue starts a new worker. Hand ownership back to
+			// producers, then recheck for an enqueue whose producer still saw
+			// this worker running.
 			a.running.Store(false)
 			if len(a.q) > 0 && a.running.CompareAndSwap(false, true) {
 				continue

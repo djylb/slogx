@@ -138,11 +138,10 @@ func newPipeline() *pipeline {
 
 const defaultQueueSize = 1024
 
-func (l *Logs) consolePipeline(idleExit bool) *pipeline {
+func (l *Logs) consolePipeline() *pipeline {
 	// The pipeline owns and closes the queue, whose WriterOutput borrows stderr.
 	//goland:noinspection GoResourceLeak
 	q := l.queue(WriterOutput(os.Stderr), defaultQueueSize, "console")
-	q.idleExit = idleExit
 	return &pipeline{routes: []Route{{Name: "console", Output: q}}, closers: []Output{q}}
 }
 
@@ -158,7 +157,7 @@ func (l *Logs) init() {
 	l.once.Do(func() {
 		l.levels = newLevels()
 		l.sampler = newSamplerN(0)
-		p := l.consolePipeline(false)
+		p := l.consolePipeline()
 		l.levels.view = &p.levels
 		p.levels.Store(l.levels.cur.Load())
 		l.pipe.Store(p)
@@ -495,7 +494,7 @@ func (l *Logs) manage(op func(Output) error) error {
 func (l *Logs) Close() error {
 	l.init()
 	l.mu.Lock()
-	p := l.consolePipeline(true)
+	p := l.consolePipeline()
 	l.levels.stopView(&p.levels)
 	old := l.pipe.Swap(p)
 	attachments := l.attached.Swap(new([]*attachment))
